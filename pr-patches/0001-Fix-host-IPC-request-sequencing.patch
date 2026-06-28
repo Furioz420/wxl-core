@@ -1,0 +1,184 @@
+From 6a0dfe704c4ddd3401262052c7ef64827ae7bc8c Mon Sep 17 00:00:00 2001
+From: Furioz <fu2iosa@gmail.com>
+Date: Sun, 28 Jun 2026 10:54:26 +0200
+Subject: [PATCH] Fix host IPC request sequencing
+
+---
+ src/host/ipc/ShmServer.cpp        | 11 +++++++----
+ src/host/ipc/ShmServer.hpp        |  8 +++++---
+ src/host/main.cpp                 |  5 +++--
+ src/runtime/storage/ShmClient.cpp | 32 +++++++++++++++++++++++++------
+ 4 files changed, 41 insertions(+), 15 deletions(-)
+
+diff --git a/src/host/ipc/ShmServer.cpp b/src/host/ipc/ShmServer.cpp
+index a0d00bf..c6e0e34 100644
+--- a/src/host/ipc/ShmServer.cpp
++++ b/src/host/ipc/ShmServer.cpp
+@@ -67,18 +67,20 @@ namespace wxl::host::ipc
+     }
+ 
+     /**
+-     * @brief Blocks on channel `i`'s request event and copies the request payload out.
++     * @brief Blocks on channel `i`'s request event and copies the request sequence and payload out.
+      * @param i       channel index
++     * @param seqOut  receives the request sequence captured with the payload
+      * @param reqOut  receives the request payload bytes
+      * @return true if a request was read
+      */
+-    bool WaitRequest(uint32_t i, std::vector<uint8_t>& reqOut)
++    bool WaitRequest(uint32_t i, uint32_t& seqOut, std::vector<uint8_t>& reqOut)
+     {
+         if (i >= kChannels) return false;
+         if (WaitForSingleObject(g_reqEv[i], INFINITE) != WAIT_OBJECT_0) return false;
+ 
+         const ControlHeader* hdr = ChannelHeader(g_base, i);
+         const uint8_t* payload = ChannelPayload(g_base, i);
++        seqOut = hdr->reqSeq;
+         uint32_t n = hdr->reqLen;
+         if (n > kChannelPayload) n = 0; // malformed: hand the worker an empty request
+         reqOut.assign(payload, payload + n);
+@@ -88,10 +90,11 @@ namespace wxl::host::ipc
+     /**
+      * @brief Copies the response payload into channel `i`, marks it complete, and signals the client.
+      * @param i     channel index
++     * @param seq   request sequence this response belongs to
+      * @param resp  response payload bytes
+      * @return true if a nonzero-length response was written
+      */
+-    bool PostResponse(uint32_t i, std::span<const uint8_t> resp)
++    bool PostResponse(uint32_t i, uint32_t seq, std::span<const uint8_t> resp)
+     {
+         if (i >= kChannels) return false;
+ 
+@@ -101,7 +104,7 @@ namespace wxl::host::ipc
+         if (n > kChannelPayload) n = 0; // never overrun the window; signal a zero-length response
+         if (n) memcpy(payload, resp.data(), n);
+         hdr->respLen = n;
+-        hdr->respSeq = hdr->reqSeq; // marks the response complete for this request
++        hdr->respSeq = seq; // marks the response complete for the request we copied
+         SetEvent(g_respEv[i]);
+         return n != 0;
+     }
+diff --git a/src/host/ipc/ShmServer.hpp b/src/host/ipc/ShmServer.hpp
+index 554f868..f709ded 100644
+--- a/src/host/ipc/ShmServer.hpp
++++ b/src/host/ipc/ShmServer.hpp
+@@ -33,18 +33,20 @@ namespace wxl::host::ipc
+     bool Create();
+ 
+     /**
+-     * @brief Blocks until channel `i` has a request and returns its payload bytes.
++     * @brief Blocks until channel `i` has a request and returns its sequence and payload bytes.
+      * @param i       channel index
++     * @param seqOut  receives the request sequence captured with the payload
+      * @param reqOut  receives the request payload bytes
+      * @return true if a request was read
+      */
+-    bool WaitRequest(uint32_t i, std::vector<uint8_t>& reqOut);
++    bool WaitRequest(uint32_t i, uint32_t& seqOut, std::vector<uint8_t>& reqOut);
+ 
+     /**
+      * @brief Writes the response payload to channel `i` and signals the client.
+      * @param i     channel index
++     * @param seq   request sequence this response belongs to
+      * @param resp  response payload bytes
+      * @return true if a nonzero-length response was written
+      */
+-    bool PostResponse(uint32_t i, std::span<const uint8_t> resp);
++    bool PostResponse(uint32_t i, uint32_t seq, std::span<const uint8_t> resp);
+ }
+diff --git a/src/host/main.cpp b/src/host/main.cpp
+index 073e097..42a12d5 100644
+--- a/src/host/main.cpp
++++ b/src/host/main.cpp
+@@ -328,9 +328,10 @@ namespace
+         std::vector<uint8_t> req, resp; // request and response payload buffers, reused each iteration
+         for (;;)
+         {
+-            if (!wxl::host::ipc::WaitRequest(0, req)) break;
++            uint32_t reqSeq = 0;
++            if (!wxl::host::ipc::WaitRequest(0, reqSeq, req)) break;
+             ProcessRequest(req, resp);
+-            wxl::host::ipc::PostResponse(0, resp);
++            wxl::host::ipc::PostResponse(0, reqSeq, resp);
+         }
+         return 0;
+     }
+diff --git a/src/runtime/storage/ShmClient.cpp b/src/runtime/storage/ShmClient.cpp
+index b451adf..8d191eb 100644
+--- a/src/runtime/storage/ShmClient.cpp
++++ b/src/runtime/storage/ShmClient.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "runtime/storage/ShmClient.hpp"
+ 
++#include "core/Logger.hpp"
+ #include "events/Event.hpp"
+ #include "host/ipc/Protocol.hpp"
+ 
+@@ -42,7 +43,10 @@ namespace
+     // --- channel pool: a free channel is acquired per request, then released ---
+     std::atomic<bool> g_channelBusy[kChannels] = {}; // false = free
+ 
+-    constexpr uint32_t kRequestTimeoutMs = 2000;
++    // Cold modern transforms can take several seconds before the host cache is warm. Timing out here
++    // makes the client fall back to native archives, which cannot see host-owned loose patch dirs.
++    constexpr uint32_t kRequestTimeoutMs = 30000;
++    std::atomic<uint32_t> g_timeouts{ 0 };
+ 
+     /**
+      * @brief Returns the directory of this module, i.e. the client root.
+@@ -147,16 +151,31 @@ namespace
+      * @param req  request payload.
+      * @return true when a response arrives before the timeout.
+      */
+-    bool SendOnChannel(uint32_t ch, const std::vector<uint8_t>& req)
++    bool SendOnChannel(uint32_t ch, const std::vector<uint8_t>& req, uint32_t& seqOut)
+     {
+         if (req.size() > kChannelPayload) return false;
+         auto* hdr = ChannelHeader(g_base, ch);
+         uint8_t* payload = ChannelPayload(g_base, ch);
++        ResetEvent(g_respEvent[ch]);
+         memcpy(payload, req.data(), req.size());
+         hdr->reqLen = static_cast<uint32_t>(req.size());
+-        ++hdr->reqSeq;
++        seqOut = ++hdr->reqSeq;
+         SetEvent(g_reqEvent[ch]);
+-        return WaitForSingleObject(g_respEvent[ch], kRequestTimeoutMs) == WAIT_OBJECT_0;
++
++        DWORD waited = 0;
++        while (waited < kRequestTimeoutMs)
++        {
++            DWORD slice = kRequestTimeoutMs - waited;
++            if (slice > 50) slice = 50;
++            DWORD rc = WaitForSingleObject(g_respEvent[ch], slice);
++            if (rc == WAIT_OBJECT_0 && hdr->respSeq == seqOut) return true;
++            if (rc != WAIT_OBJECT_0 && rc != WAIT_TIMEOUT) return false;
++            waited += slice;
++        }
++        uint32_t timeout = ++g_timeouts;
++        if (timeout <= 20)
++            WLOG_WARN("ipc: request seq=%u timed out after %u ms", seqOut, kRequestTimeoutMs);
++        return false;
+     }
+ 
+     /**
+@@ -173,12 +192,13 @@ namespace
+     {
+         if (!ConnectInner()) return false;
+         uint32_t ch = AcquireChannel();
+-        bool ok = SendOnChannel(ch, req);
++        uint32_t reqSeq = 0;
++        bool ok = SendOnChannel(ch, req, reqSeq);
+         if (ok)
+         {
+             auto* hdr = ChannelHeader(g_base, ch);
+             const uint8_t* payload = ChannelPayload(g_base, ch);
+-            if (hdr->respLen && hdr->respLen <= kChannelPayload)
++            if (hdr->respSeq == reqSeq && hdr->respLen && hdr->respLen <= kChannelPayload)
+                 onResponse(flexbuffers::GetRoot(payload, hdr->respLen).AsVector());
+         }
+         ReleaseChannel(ch);
+-- 
+2.51.1.windows.1
+

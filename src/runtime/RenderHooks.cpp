@@ -43,11 +43,13 @@ namespace
 
     using DrawBatchFn = void (__fastcall*)(void* ctx, void* edx);
     using DIPFn       = long (__stdcall*)(void*, int, int, unsigned, unsigned, unsigned, unsigned);
+    using ResetFn     = long (__stdcall*)(void*, D3DPRESENT_PARAMETERS*);
     using EndSceneFn  = long (__stdcall*)(void*);
     using PresentFn   = long (__stdcall*)(void*, const void*, const void*, void*, const void*);
 
     DrawBatchFn g_origDrawBatch = nullptr;
     DIPFn       g_origDIP       = nullptr;
+    ResetFn     g_origReset     = nullptr;
     EndSceneFn  g_origEndScene  = nullptr;
     PresentFn   g_origPresent   = nullptr;
     off::WorldRenderFinalizeFn g_origWorldFinalize = nullptr;
@@ -145,6 +147,47 @@ namespace
             ev::M2BatchDrawArgs a{ dev, g_curModel, pt, bv, mi, nv, si, pc };
             ev::Emit(ev::Event::OnM2BatchDraw, &a);
             g_inM2Emit = false;
+        }
+        return r;
+    }
+
+    /**
+     * @brief Detours D3D9 Reset, bracketing device-loss resource teardown/recreate.
+     * @param dev     D3D9 device.
+     * @param params  reset presentation parameters.
+     * @return the Reset result.
+     */
+    long __stdcall hkReset(void* dev, D3DPRESENT_PARAMETERS* params)
+    {
+        static unsigned resetLog = 0;
+        const bool logThis = resetLog < 16;
+        if (logThis)
+        {
+            ++resetLog;
+            WLOG_INFO("render: Reset begin %ux%u windowed=%u",
+                      params ? params->BackBufferWidth : 0,
+                      params ? params->BackBufferHeight : 0,
+                      params ? static_cast<unsigned>(params->Windowed) : 0);
+        }
+
+        ev::DeviceResetArgs a{ dev, params };
+        gx::ReleaseResetResources();
+        ev::Emit(ev::Event::OnDeviceLost, &a);
+
+        const long r = g_origReset(dev, params);
+        if (SUCCEEDED(r))
+        {
+            ev::Emit(ev::Event::OnDeviceReset, &a);
+            if (logThis) WLOG_INFO("render: Reset ok");
+        }
+        else
+        {
+            static unsigned logged = 0;
+            if (logged < 8)
+            {
+                ++logged;
+                WLOG_WARN("render: Reset failed hr=0x%08lX", static_cast<unsigned long>(r));
+            }
         }
         return r;
     }
@@ -323,6 +366,8 @@ namespace wxl::runtime::render
 
         SwapVtbl(vtbl, off::vt::kDrawIndexedPrimitive, reinterpret_cast<void*>(&hkDIP),
                  reinterpret_cast<void**>(&g_origDIP));
+        SwapVtbl(vtbl, off::vt::kReset, reinterpret_cast<void*>(&hkReset),
+                 reinterpret_cast<void**>(&g_origReset));
         SwapVtbl(vtbl, off::vt::kEndScene, reinterpret_cast<void*>(&hkEndScene),
                  reinterpret_cast<void**>(&g_origEndScene));
         SwapVtbl(vtbl, off::vt::kPresent, reinterpret_cast<void*>(&hkPresent),
@@ -342,6 +387,6 @@ namespace wxl::runtime::render
                                  reinterpret_cast<void*>(&hkLiquidRender),
                                  reinterpret_cast<void**>(&g_origLiquidRender));
 
-        WLOG_INFO("render: hooks installed (DIP, EndScene, Present, DrawBatch, WorldFinalize, RibbonDraw, LiquidRenderPass)");
+        WLOG_INFO("render: hooks installed (DIP, Reset, EndScene, Present, DrawBatch, WorldFinalize, RibbonDraw, LiquidRenderPass)");
     }
 }

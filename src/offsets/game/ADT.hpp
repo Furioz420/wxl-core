@@ -31,6 +31,19 @@ namespace wxl::offsets::game::adt
     // bbox, texture-layer units, ref spawn). The "a terrain chunk was built" point, distinct from the
     // per-frame terrain draw.
     constexpr uintptr_t kChunkBuild = 0x007C64B0;
+
+    // Liquid-height query site that reads a LiquidType row's flag byte WITHOUT the null guard every other
+    // liquid consumer has: an unknown liquid id (no row) faults here. The bytes `F6 40 08 04 74 08`
+    // (test byte[eax+8],4 ; jz +8) are repatched so the test is skipped and the jump is unconditional,
+    // taking the default (no water-surface bump) path like the guarded consumers.
+    constexpr uintptr_t kLiquidRowFlagTest = 0x007C846C;
+
+    // Map-chunk teardown (__fastcall, ecx=chunk). Frees the chunk's async IO buffer at +0x80 while a
+    // queued async-read completion may still target it; hooked to cancel that read (the async object at
+    // +0x70) before the free so the completion cannot run against freed memory.
+    constexpr uintptr_t kChunkDestroy = 0x007D6E10;
+    using ChunkDestroyFn = void(__fastcall*)(void* chunk);
+    constexpr size_t kOffChunkAsyncObj = 0x70; // CMapChunk -> CAsyncObject* for its in-flight read
     // Near-tile placed-object counter (chunk, &progress, total) -> count of placed-object children still
     // loading that overlap the chunk box.
     constexpr uintptr_t kNearObjectCount = 0x007B50B0;

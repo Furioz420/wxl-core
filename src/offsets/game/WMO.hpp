@@ -86,6 +86,17 @@ namespace wxl::offsets::game::wmo
     constexpr uintptr_t kCurrentInteriorInstance = 0x00CD87A4;
     // Instance field: pointer to the owning root object (the one with the inline path at kOffNameInline).
     constexpr size_t kOffInstanceRoot = 0xF4;
+    // Doodad-set selection on the placed instance: the primary selected set (from MODF+0x3A) and up to 3
+    // extra sets. A doodad renders iff its owning set is 0, the selected set, or one of the extra sets.
+    constexpr size_t kOffInstanceDoodadSet = 0x100; // u32 selected set index
+    constexpr size_t kOffInstanceExtraSets = 0x150; // u16[3] extra set indices (0 = unused)
+    // Root doodad-set table fields: the MODS array and its entry count.
+    constexpr size_t kOffRootMods        = 0x14C; // -> MODS array (SMODoodadSet, stride kModsStride)
+    constexpr size_t kOffRootDoodadSets  = 0x188; // u32 doodad-set count (MODS_size / 0x20)
+    constexpr size_t kOffRootDoodadDefs  = 0x190; // u32 doodad-def count (MODD bound)
+    constexpr size_t kModsStride         = 0x20;  // SMODoodadSet stride
+    constexpr size_t kOffModsStart       = 0x14;  // u32 first MODD index in the set
+    constexpr size_t kOffModsCount       = 0x18;  // u32 MODD count in the set
     constexpr uintptr_t kPortalRect        = 0x00ADF58C; // float[5]: minX,minY,maxX,maxY,nearExtent
     constexpr uintptr_t kOutdoorEnabled    = 0x00ADF59C; // float; >= 0 when the outdoor pass runs
 

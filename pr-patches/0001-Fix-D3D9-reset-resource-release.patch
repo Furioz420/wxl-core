@@ -1,0 +1,239 @@
+From 151c64cf634c39329bfaa05e4f281fa844928291 Mon Sep 17 00:00:00 2001
+From: Furioz <fu2iosa@gmail.com>
+Date: Sun, 28 Jun 2026 10:55:59 +0200
+Subject: [PATCH] Fix D3D9 reset resource release
+
+---
+ src/events/Event.hpp        |  4 +++
+ src/game/gx/Gx.cpp          | 35 ++++++++++++++++++++++++++
+ src/game/gx/Gx.hpp          |  9 +++++++
+ src/offsets/engine/Gx.hpp   |  1 +
+ src/runtime/RenderHooks.cpp | 49 ++++++++++++++++++++++++++++++++++++-
+ src/runtime/RenderHooks.hpp |  5 ++--
+ 6 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/src/events/Event.hpp b/src/events/Event.hpp
+index 9d796eb..3b64782 100644
+--- a/src/events/Event.hpp
++++ b/src/events/Event.hpp
+@@ -32,6 +32,8 @@ namespace wxl::events
+         OnM2SkinFinalize,// a model's skin profile is being finalized  (M2SkinFinalizeArgs)
+         OnFrame,         // per-frame Present                          (FrameArgs)
+         OnEndScene,      // end of the frame, before present           (EndSceneArgs)
++        OnDeviceLost,    // before IDirect3DDevice9::Reset releases resources (DeviceResetArgs)
++        OnDeviceReset,   // after a successful IDirect3DDevice9::Reset  (DeviceResetArgs)
+         OnUpdate,        // once-per-frame logic tick, with delta time (UpdateArgs)
+         OnWorldRender,   // per-frame world draw pass                  (WorldRenderArgs)
+         OnWorldRenderEnd,// world -> UI boundary, the post-fx slot     (WorldRenderEndArgs)
+@@ -73,6 +75,8 @@ namespace wxl::events
+     struct UpdateArgs         { float dt; uint32_t timeMs; };
+     /** @brief Args for OnEndScene. */
+     struct EndSceneArgs       { void* device; };
++    /** @brief Args for OnDeviceLost and OnDeviceReset. */
++    struct DeviceResetArgs    { void* device; void* params; };
+     /** @brief Args for OnWorldRender. */
+     struct WorldRenderArgs    { void* device; };
+     /**
+diff --git a/src/game/gx/Gx.cpp b/src/game/gx/Gx.cpp
+index 5e22faf..57a4efe 100644
+--- a/src/game/gx/Gx.cpp
++++ b/src/game/gx/Gx.cpp
+@@ -18,10 +18,28 @@
+ 
+ #include <d3d9.h>
+ #include <d3dcompiler.h>
++#include <algorithm>
+ #include <cstring>
++#include <vector>
+ 
+ namespace wxl::game::gx
+ {
++    namespace
++    {
++        std::vector<RenderTarget*>& ResetTargets()
++        {
++            static std::vector<RenderTarget*> targets;
++            return targets;
++        }
++
++        void TrackResetTarget(RenderTarget& rt)
++        {
++            auto& targets = ResetTargets();
++            if (std::find(targets.begin(), targets.end(), &rt) == targets.end())
++                targets.push_back(&rt);
++        }
++    }
++
+     /**
+      * @brief Compiles an HLSL pixel shader into a device shader.
+      * @param dev     the device to create the shader on.
+@@ -75,9 +93,26 @@ namespace wxl::game::gx
+         rt.surface = surf;
+         rt.width   = static_cast<int>(desc.Width);
+         rt.height  = static_cast<int>(desc.Height);
++        TrackResetTarget(rt);
+         return true;
+     }
+ 
++    void Release(RenderTarget& rt)
++    {
++        Release(rt.surface);
++        Release(rt.texture);
++        rt.surface = nullptr;
++        rt.texture = nullptr;
++        rt.width = 0;
++        rt.height = 0;
++    }
++
++    void ReleaseResetResources()
++    {
++        for (RenderTarget* rt : ResetTargets())
++            if (rt) Release(*rt);
++    }
++
+     /**
+      * @brief Draws a back-buffer-sized textured quad sampling texture stage 0.
+      * @param dev  the device to draw on.
+diff --git a/src/game/gx/Gx.hpp b/src/game/gx/Gx.hpp
+index a9f459b..8a67f0d 100644
+--- a/src/game/gx/Gx.hpp
++++ b/src/game/gx/Gx.hpp
+@@ -262,6 +262,12 @@ namespace wxl::game::gx
+     /** @brief A render target sized to the back buffer: texture plus its level-0 surface. */
+     struct RenderTarget { void* texture = nullptr; void* surface = nullptr; int width = 0; int height = 0; };
+ 
++    /**
++     * @brief Releases a render target's COM objects and clears its fields.
++     * @param rt  render target to release.
++     */
++    void Release(RenderTarget& rt);
++
+     /**
+      * @brief Creates or keeps a back-buffer-sized render target of the given format.
+      * @param dev        the device to create the target on.
+@@ -271,6 +277,9 @@ namespace wxl::game::gx
+      */
+     bool EnsureBackbufferTarget(Device9 dev, RenderTarget& rt, uint32_t d3dFormat);
+ 
++    /** @brief Releases render targets created through EnsureBackbufferTarget before a D3D reset. */
++    void ReleaseResetResources();
++
+     /**
+      * @brief Draws a back-buffer-sized textured quad.
+      * @param dev  the device to draw on.
+diff --git a/src/offsets/engine/Gx.hpp b/src/offsets/engine/Gx.hpp
+index c1ff5a2..d10b4f0 100644
+--- a/src/offsets/engine/Gx.hpp
++++ b/src/offsets/engine/Gx.hpp
+@@ -137,6 +137,7 @@ namespace wxl::offsets::engine::gx
+     namespace vt
+     {
+         constexpr unsigned kRelease                = 2;  // COM / shader object release
++        constexpr unsigned kReset                  = 16; // IDirect3DDevice9::Reset (resize/device-loss recovery)
+         constexpr unsigned kPresent                = 17; // IDirect3DDevice9::Present (per-frame flip)
+         constexpr unsigned kGetBackBuffer          = 18;
+         constexpr unsigned kCreateTexture          = 23;
+diff --git a/src/runtime/RenderHooks.cpp b/src/runtime/RenderHooks.cpp
+index 759c151..c6bf92c 100644
+--- a/src/runtime/RenderHooks.cpp
++++ b/src/runtime/RenderHooks.cpp
+@@ -44,11 +44,13 @@ namespace
+ 
+     using DrawBatchFn = void (__fastcall*)(void* ctx, void* edx);
+     using DIPFn       = long (__stdcall*)(void*, int, int, unsigned, unsigned, unsigned, unsigned);
++    using ResetFn     = long (__stdcall*)(void*, D3DPRESENT_PARAMETERS*);
+     using EndSceneFn  = long (__stdcall*)(void*);
+     using PresentFn   = long (__stdcall*)(void*, const void*, const void*, void*, const void*);
+ 
+     DrawBatchFn g_origDrawBatch = nullptr;
+     DIPFn       g_origDIP       = nullptr;
++    ResetFn     g_origReset     = nullptr;
+     EndSceneFn  g_origEndScene  = nullptr;
+     PresentFn   g_origPresent   = nullptr;
+     off::WorldRenderFinalizeFn g_origWorldFinalize = nullptr;
+@@ -263,6 +265,49 @@ namespace
+         g_ssaaDevice = nullptr;
+     }
+ 
++    /**
++     * @brief Detours D3D9 Reset, bracketing device-loss resource teardown/recreate.
++     * @param dev     D3D9 device.
++     * @param params  reset presentation parameters.
++     * @return the Reset result.
++     */
++    long __stdcall hkReset(void* dev, D3DPRESENT_PARAMETERS* params)
++    {
++        static unsigned resetLog = 0;
++        const bool logThis = resetLog < 16;
++        if (logThis)
++        {
++            ++resetLog;
++            WLOG_INFO("render: Reset begin %ux%u windowed=%u",
++                      params ? params->BackBufferWidth : 0,
++                      params ? params->BackBufferHeight : 0,
++                      params ? static_cast<unsigned>(params->Windowed) : 0);
++        }
++
++        ev::DeviceResetArgs a{ dev, params };
++        g_ssaaRedirect = false;
++        SsaaReleaseTargets();
++        gx::ReleaseResetResources();
++        ev::Emit(ev::Event::OnDeviceLost, &a);
++
++        const long r = g_origReset(dev, params);
++        if (SUCCEEDED(r))
++        {
++            ev::Emit(ev::Event::OnDeviceReset, &a);
++            if (logThis) WLOG_INFO("render: Reset ok");
++        }
++        else
++        {
++            static unsigned logged = 0;
++            if (logged < 8)
++            {
++                ++logged;
++                WLOG_WARN("render: Reset failed hr=0x%08lX", static_cast<unsigned long>(r));
++            }
++        }
++        return r;
++    }
++
+     /** @brief Creates (or recreates on device/size change) the offscreen world color RT + INTZ depth. */
+     bool SsaaEnsureTargets(IDirect3DDevice9* dev, UINT nativeW, UINT nativeH, float factor, D3DFORMAT colorFmt)
+     {
+@@ -522,6 +567,8 @@ namespace wxl::runtime::render
+ 
+         SwapVtbl(vtbl, off::vt::kDrawIndexedPrimitive, reinterpret_cast<void*>(&hkDIP),
+                  reinterpret_cast<void**>(&g_origDIP));
++        SwapVtbl(vtbl, off::vt::kReset, reinterpret_cast<void*>(&hkReset),
++                 reinterpret_cast<void**>(&g_origReset));
+         SwapVtbl(vtbl, off::vt::kEndScene, reinterpret_cast<void*>(&hkEndScene),
+                  reinterpret_cast<void**>(&g_origEndScene));
+         SwapVtbl(vtbl, off::vt::kPresent, reinterpret_cast<void*>(&hkPresent),
+@@ -541,6 +588,6 @@ namespace wxl::runtime::render
+                                  reinterpret_cast<void*>(&hkLiquidRender),
+                                  reinterpret_cast<void**>(&g_origLiquidRender));
+ 
+-        WLOG_INFO("render: hooks installed (DIP, EndScene, Present, DrawBatch, WorldFinalize, RibbonDraw, LiquidRenderPass)");
++        WLOG_INFO("render: hooks installed (DIP, Reset, EndScene, Present, DrawBatch, WorldFinalize, RibbonDraw, LiquidRenderPass)");
+     }
+ }
+diff --git a/src/runtime/RenderHooks.hpp b/src/runtime/RenderHooks.hpp
+index 2cb033c..6345a0d 100644
+--- a/src/runtime/RenderHooks.hpp
++++ b/src/runtime/RenderHooks.hpp
+@@ -21,8 +21,9 @@ namespace wxl::runtime::render
+     /**
+      * @brief Installs the render-pipeline detours that republish render events.
+      *
+-     * Emits OnM2BatchDraw, OnEndScene, OnFrame and OnWorldRenderEnd. Call once after the graphics
+-     * device is up; the function detours are armed by the caller's EnableAll() afterwards.
++     * Emits OnM2BatchDraw, OnEndScene, OnFrame, OnDeviceLost, OnDeviceReset and OnWorldRenderEnd.
++     * Call once after the graphics device is up; the function detours are armed by the caller's
++     * EnableAll() afterwards.
+      */
+     void Install();
+ }
+-- 
+2.51.1.windows.1
+

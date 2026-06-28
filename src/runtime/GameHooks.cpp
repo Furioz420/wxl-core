@@ -18,6 +18,7 @@
 
 #include "core/Hook.hpp"
 #include "core/Logger.hpp"
+#include "core/Mem.hpp"
 #include "events/Event.hpp"
 #include "offsets/engine/Frame.hpp"
 #include "offsets/engine/Gx.hpp"
@@ -32,6 +33,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -54,9 +56,11 @@ namespace
     m2::M2_SetupBatchAlphaFn   g_origSetupAlpha   = nullptr;
     dd::SpawnFromMDDFFn        g_origDoodadSpawn  = nullptr;
     wmo::Wmo_SpawnFromModfFn   g_origWmoSpawn     = nullptr;
-    gxoff::TextureUpdateFn     g_origTexUpdate    = nullptr;
-    gxoff::TextureCreateFn     g_origTexCreate    = nullptr;
+    gxoff::TextureUpdateFn       g_origTexUpdate    = nullptr;
+    gxoff::TextureCreateFn       g_origTexCreate    = nullptr;
+    wld::AsyncServiceQueuesFn    g_origAsyncDrain   = nullptr;
     adt::Map_ChunkBuildFn      g_origChunkBuild   = nullptr;
+    adt::ChunkDestroyFn        g_origChunkDestroy = nullptr;
     wmo::Wmo_RootCompleteFn    g_origWmoRoot      = nullptr;
     wmo::WmoGroup_ParseFn      g_origWmoGroup     = nullptr;
     wld::World_EnterFn         g_origWorldEnter   = nullptr;
@@ -151,6 +155,44 @@ namespace
     }
 
     /**
+     * @brief Reports a freshly spawned WMO's live doodad-set selection against its loaded MODS.
+     *
+     * Catches the in-game "all doodad sets render at once" case by reading the post-down-convert MODS the
+     * Client actually loaded (not the on-disk file) plus the instance's selected/extra sets. Logs only a
+     * suspicious shape: an extra set populated, a selected index out of range, or a set 0 whose MODD range
+     * swallows the other content sets (every doodad then resolves to set 0, which renders unconditionally).
+     * A correctly selected WMO stays silent.
+     * @param inst  freshly spawned WMO instance.
+     */
+    void DiagDoodadSets(void* inst)
+    {
+        auto* root = *reinterpret_cast<void**>(static_cast<uint8_t*>(inst) + wmo::kOffInstanceRoot);
+        if (!root)
+            return;
+        const uint32_t nSets = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(root) + wmo::kOffRootDoodadSets);
+        if (nSets < 2)
+            return; // a single-set WMO cannot show "extra" sets
+        const uint8_t* mods = *reinterpret_cast<uint8_t**>(static_cast<uint8_t*>(root) + wmo::kOffRootMods);
+        if (!mods)
+            return;
+        const uint32_t nDefs = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(root) + wmo::kOffRootDoodadDefs);
+        const uint32_t sel   = *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(inst) + wmo::kOffInstanceDoodadSet);
+        const uint16_t* extra = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(inst) + wmo::kOffInstanceExtraSets);
+        const char* name = reinterpret_cast<const char*>(static_cast<uint8_t*>(root) + wmo::kOffNameInline);
+        const uint32_t s0count = *reinterpret_cast<const uint32_t*>(mods + wmo::kOffModsCount);
+
+        const bool greedy0  = nDefs && s0count + 1 >= nDefs;    // set 0 covers (almost) every def
+        const bool selOob   = sel >= nSets;                     // selected index out of range
+        const bool hasExtra = extra[0] || extra[1] || extra[2]; // extra sets populated
+        if (!greedy0 && !selOob && !hasExtra)
+            return; // selection resolves to {set0, sel} only -> correct, stay silent
+
+        WLOG_INFO("wmo-doodad-diag: %.96s nSets=%u nDefs=%u sel=%u extra={%u,%u,%u} set0count=%u%s%s%s",
+            name, nSets, nDefs, sel, extra[0], extra[1], extra[2], s0count,
+            greedy0 ? " GREEDY-SET0" : "", selOob ? " SEL-OOB" : "", hasExtra ? " EXTRA-SETS" : "");
+    }
+
+    /**
      * @brief Detours the WMO instance spawn, applying the per-instance MODF scale the Client ignores.
      *
      * The Client builds the instance at scale 1.0 (MODF+0x3E is padding to it). After the native spawn,
@@ -172,6 +214,8 @@ namespace
         if (!inst || !modf)
             return inst;
 
+        DiagDoodadSets(inst);
+
         const uint16_t raw = *reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(modf) + wmo::kOffModfScale);
         if (raw == 0 || raw == 1024)
             return inst; // native / unscaled: leave the instance byte-for-byte
@@ -190,6 +234,13 @@ namespace
      * @brief Detours texture upload, emitting OnTextureUpload before the device update.
      *
      * width=x2-x and height=y2-y cover both full-surface (x=y=0) and sub-rect uploads.
+     *
+     * The mip source the upload reads is a process-wide singleton pointer table (kMipTablePtr) that a
+     * build fills with raw aliases into its transient IO buffer; back-to-back doodad/texture loads let a
+     * later build overwrite that table and free its buffer while this upload still reads it, an
+     * access-violation use-after-free (0x40cb6a). Clearing kMipTableValid here routes the upload through
+     * the engine's own safety net: with the flag down, the source callback re-reads the .blp into a fresh
+     * buffer instead of trusting the singleton aliases, so the upload never reads a freed page.
      * @param tex   texture being uploaded.
      * @param x     upload rect left.
      * @param y     upload rect top.
@@ -201,7 +252,113 @@ namespace
     {
         ev::TextureUploadArgs a{ tex, static_cast<uint32_t>(x2 - x), static_cast<uint32_t>(y2 - y) };
         ev::Emit(ev::Event::OnTextureUpload, &a);
+        // *reinterpret_cast<uint32_t*>(gxoff::kMipTableValid) = 0;
         g_origTexUpdate(tex, x, y, x2, y2, flag);
+    }
+
+    // Per-thread async-drain recursion depth. A texture build force-waits nested reads, which re-enter the
+    // completion drain; a nested pump running unrelated completions frees / rewrites a buffer the outer
+    // build still uploads from (the 0x40cb6a use-after-free).
+    thread_local int g_drainDepth = 0;
+
+    // Serialize the reentrant drain. The completed-read queue is a Blizzard TSExplicitList: each node holds
+    // its link at node+0x28 {next, tagged-prev}; the head (a node base) is at the completed-head global.
+    // Addresses + arithmetic verified against the drain's own head-unlink. The lock is a recursive Storm
+    // critical section taken by ECX.
+    namespace adrain
+    {
+        constexpr uint32_t kLockEnter     = 0x00774640; // SCritSect enter, ecx = lock
+        constexpr uint32_t kLockLeave     = 0x00774650; // SCritSect leave, ecx = lock
+        constexpr uint32_t kAsyncLock     = 0x00B4A240; // the recursive queue lock
+        constexpr uint32_t kCompletedHead = 0x00AC3474; // first completed node (sentinel/empty if &1 or 0)
+        constexpr uint32_t kAwaitedObj    = 0x00B4A204; // node a force-wait blocks on (0 = none)
+        constexpr uint32_t kPendingCount  = 0x00B4A1F8; // outstanding-completion counter
+        constexpr uint32_t kLinkOffset    = 0x28;       // node -> link byte offset
+
+        inline uint32_t Rd(uint32_t a)             { return *reinterpret_cast<uint32_t*>(a); }
+        inline void     Wr(uint32_t a, uint32_t v) { *reinterpret_cast<uint32_t*>(a) = v; }
+        inline uint8_t  RdB(uint32_t a)            { return *reinterpret_cast<uint8_t*>(a); }
+        inline void     WrB(uint32_t a, uint8_t v) { *reinterpret_cast<uint8_t*>(a) = v; }
+        inline void Lock()   { reinterpret_cast<void(__thiscall*)(uint32_t)>(kLockEnter)(kAsyncLock); }
+        inline void Unlock() { reinterpret_cast<void(__thiscall*)(uint32_t)>(kLockLeave)(kAsyncLock); }
+
+        // Detach one node from the completed list (the engine's own head-unlink arithmetic, generalised).
+        void Unlink(uint32_t node)
+        {
+            const uint32_t linkNext = node + 0x28;
+            const uint32_t next = Rd(linkNext);
+            if (next != 0)
+            {
+                const uint32_t prev = Rd(node + 0x2c);
+                const uint32_t prevSlot = ((prev & 1u) == 0u && prev != 0u)
+                                              ? linkNext + (prev - Rd(next + 4))
+                                              : (prev & 0xFFFFFFFEu);
+                Wr(prevSlot, next);
+                Wr(next + 4, Rd(node + 0x2c));
+                Wr(linkNext, 0);
+                Wr(node + 0x2c, 0);
+            }
+            else
+            {
+                const uint32_t prev = Rd(node + 0x2c);
+                if ((prev & 1u) != 0u || prev == 0u)
+                    Wr(prev & 0xFFFFFFFEu, 0);
+                Wr(node + 0x2c, 0);
+            }
+        }
+
+        // True if target is currently enqueued in the completed list.
+        bool Enqueued(uint32_t target)
+        {
+            uint32_t node = Rd(kCompletedHead);
+            if ((node & 1u) != 0u || node == 0u) return false;
+            for (;;)
+            {
+                if (node == target) return true;
+                const uint32_t next = Rd(node + 0x28);
+                if (next == 0) return false;
+                node = next - kLinkOffset;
+            }
+        }
+
+        // Process ONLY the awaited node; leave every other completion queued for the outer pump.
+        int DrainAwaitedOnly()
+        {
+            Lock();
+            const uint32_t target = Rd(kAwaitedObj);
+            if (target == 0) { Unlock(); return 1; }
+            if (RdB(target + 0x21) != 0) // already serviced this turn
+            {
+                if (Rd(kAwaitedObj) == target) Wr(kAwaitedObj, 0);
+                Unlock();
+                return 1;
+            }
+            if (!Enqueued(target)) { Unlock(); return 1; } // armed but not yet delivered by the worker
+            Unlink(target);
+            if (Rd(kAwaitedObj) == target) Wr(kAwaitedObj, 0);
+            WrB(target + 0x21, 1);
+            Unlock(); // the engine releases the lock before every completion call
+            reinterpret_cast<void(__cdecl*)(uint32_t)>(Rd(target + 0x10))(Rd(target + 0x0c));
+            Wr(kPendingCount, Rd(kPendingCount) - 1);
+            return 1;
+        }
+    }
+
+    /**
+     * @brief Detours the async-queue drain to serialize reentrant pumps.
+     *
+     * Depth 0 runs the full engine drain. A reentrant pump (a build force-waiting a nested read) processes
+     * only the node that wait is blocked on and leaves the rest, so no nested completion frees or rewrites
+     * a buffer the outer build is still uploading from.
+     */
+    int __cdecl hkAsyncDrain(int a, int b)
+    {
+        if (g_drainDepth > 0)
+            return adrain::DrainAwaitedOnly();
+        ++g_drainDepth;
+        const int r = g_origAsyncDrain(a, b);
+        --g_drainDepth;
+        return r;
     }
 
     /**
@@ -323,6 +480,28 @@ namespace
     }
 
     /**
+     * @brief Detours map-chunk teardown to cancel its in-flight async read before the buffer is freed.
+     *
+     * The chunk's completed-read callback parses the chunk's IO buffer (+0x80). If a teardown frees that
+     * buffer while the read is still queued, the later completion parses freed memory and faults
+     * (0x7d6f05). Retiring the async object (+0x70) here unlinks the pending completion first.
+     * @param chunk  CMapChunk being destroyed (ECX).
+     */
+    void __fastcall hkChunkDestroy(void* chunk)
+    {
+        if (chunk)
+        {
+            auto* slot = reinterpret_cast<void**>(static_cast<uint8_t*>(chunk) + adt::kOffChunkAsyncObj);
+            if (*slot)
+            {
+                reinterpret_cast<wld::AsyncDestroyFn>(wld::kAsyncDestroy)(*slot);
+                *slot = nullptr;
+            }
+        }
+        g_origChunkDestroy(chunk);
+    }
+
+    /**
      * @brief Detours WMO root read-completion, emitting OnWmoRootLoad before the native chunk walk.
      *
      * Fires once after the async read fills the root buffer and before the walker runs, so a subscriber
@@ -407,9 +586,16 @@ namespace wxl::runtime::game
         wxl::core::hook::Install("TextureCreate", gxoff::kTextureCreate,
                                  reinterpret_cast<void*>(&hkTexCreate),
                                  reinterpret_cast<void**>(&g_origTexCreate));
+        wxl::core::hook::Install("AsyncDrain", wld::kAsyncServiceQueues,
+                                 reinterpret_cast<void*>(&hkAsyncDrain),
+                                 reinterpret_cast<void**>(&g_origAsyncDrain));
         wxl::core::hook::Install("ChunkBuild", adt::kChunkBuild,
                                  reinterpret_cast<void*>(&hkChunkBuild),
                                  reinterpret_cast<void**>(&g_origChunkBuild));
+        // ChunkDestroy (ADT cancel-on-teardown) temporarily disabled: it correlates with a render-path
+        // null-deref (0x7c846c) and the RE flagged the cancel timing as unconfirmed. Re-enable after the
+        // one-shot probe (FUN_007bfe60 free + FUN_007d6ef0 entry) confirms the free is teardown vs sibling.
+        (void)&hkChunkDestroy; (void)&g_origChunkDestroy;
         wxl::core::hook::Install("WmoRootComplete", wmo::kRootComplete,
                                  reinterpret_cast<void*>(&hkWmoRootComplete),
                                  reinterpret_cast<void**>(&g_origWmoRoot));
@@ -434,6 +620,14 @@ namespace wxl::runtime::game
         wxl::core::hook::Install("PlaySound", snd::kPlaySound,
                                  reinterpret_cast<void*>(&hkPlaySound),
                                  reinterpret_cast<void**>(&g_origPlaySound));
+
+        // Liquid-row null guard: this one liquid consumer dereferences the LiquidType row flag without the
+        // null check the others have, so an unknown liquid id (from any served source) faults. Skip the
+        // flag test and make the branch unconditional (nop x4 + jz->jmp) -> default no-bump path.
+        {
+            const uint8_t guard[5] = { 0x90, 0x90, 0x90, 0x90, 0xEB };
+            wxl::core::mem::Patch(reinterpret_cast<void*>(adt::kLiquidRowFlagTest), guard, sizeof guard);
+        }
 
         WLOG_INFO("game: hooks installed (M2Init, M2FinalizeSkin, M2SetupBatchAlpha, DoodadSpawn, TextureUpdate, TextureCreate, ChunkBuild, WmoRootComplete, WmoGroupParse, CWorldEnter, FramePump, ObjectUpdate, ObjectDestroy, TargetSet, PlaySound)");
     }
