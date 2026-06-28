@@ -82,7 +82,7 @@ extern "C" IDirect3D9* WINAPI Direct3DCreate9(UINT sdkVersion)
         D3D9ON12_ARGS args = wxl::gpu::MakeOn12Args();
         IDirect3D9* d3d = g_realCreate9On12(sdkVersion, &args, 1);
         Log("d3d9proxy: Direct3DCreate9On12 -> %p (D3D12 %p queue %p)", d3d, args.pD3D12Device, args.ppD3D12Queues[0]);
-        if (d3d) return wxl::gpu::capture::Wrap(d3d);   // intercept CreateDevice to capture the device
+        if (d3d) return wxl::gpu::capture::Wrap(d3d, static_cast<ID3D12CommandQueue*>(args.ppD3D12Queues[0]));   // intercept CreateDevice to capture the device + its queue
     }
     Log("d3d9proxy: native Direct3DCreate9 fallback");
     return g_realCreate9 ? g_realCreate9(sdkVersion) : nullptr;
@@ -104,7 +104,7 @@ extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out)
         Log("d3d9proxy: Direct3DCreate9On12Ex -> hr=0x%08lx (D3D12 %p queue %p)", hr, args.pD3D12Device, args.ppD3D12Queues[0]);
         if (SUCCEEDED(hr))
         {
-            if (out && *out) *out = wxl::gpu::capture::WrapEx(*out);   // intercept CreateDeviceEx
+            if (out && *out) *out = wxl::gpu::capture::WrapEx(*out, static_cast<ID3D12CommandQueue*>(args.ppD3D12Queues[0]));   // intercept CreateDeviceEx + record its queue
             return hr;
         }
     }
@@ -122,11 +122,16 @@ extern "C" __declspec(dllexport) ID3D12Device* WxlD3D12Device()
 }
 
 /**
- * @brief Returns the shared render queue that backs On12, exposed to WarcraftXL.dll.
- * @return The shared command queue.
+ * @brief Returns the On12 queue the engine presents on, exposed to WarcraftXL.dll.
+ *
+ * The engine creates several On12 factories (a probe first, the real one later), each on its own queue.
+ * A post-process pass must use the presenting device's queue, so this returns the captured device's queue
+ * once known, falling back to the shared queue before capture.
+ * @return The presenting device's command queue.
  */
 extern "C" __declspec(dllexport) ID3D12CommandQueue* WxlD3D12Queue()
 {
+    if (ID3D12CommandQueue* q = wxl::gpu::capture::PresentQueue()) return q;
     return wxl::gpu::Queue();
 }
 
@@ -134,6 +139,21 @@ extern "C" __declspec(dllexport) ID3D12CommandQueue* WxlD3D12Queue()
 extern "C" __declspec(dllexport) void WxlD3D12DrainDebug()
 {
     wxl::gpu::DrainDebug();
+}
+
+/**
+ * @brief Sets the supersampling factor for the windowed backbuffer, exposed to WarcraftXL.dll.
+ * @param factor  1.0 (off), 1.5, 2.0, ...; takes effect on the next device create/reset.
+ */
+extern "C" __declspec(dllexport) void WxlSetSsaaFactor(float factor)
+{
+    wxl::gpu::capture::SetSsaaFactor(factor);
+}
+
+/** @brief Returns the current supersampling factor, exposed to WarcraftXL.dll. @return The factor (1.0 = off). */
+extern "C" __declspec(dllexport) float WxlGetSsaaFactor()
+{
+    return wxl::gpu::capture::SsaaFactor();
 }
 
 /**

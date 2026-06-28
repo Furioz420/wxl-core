@@ -16,6 +16,7 @@
 
 #include "gpu/Capture.hpp"
 #include "gpu/Device.hpp"
+#include "gpu/Present.hpp"
 
 #include <windows.h>
 
@@ -23,13 +24,25 @@ namespace
 {
     using wxl::gpu::Log;
 
-    IDirect3DDevice9*           g_device = nullptr;
-    wxl::gpu::capture::FrameFn  g_frame  = nullptr;
+    IDirect3DDevice9*           g_device       = nullptr;
+    ID3D12CommandQueue*         g_presentQueue = nullptr;
+    HWND                        g_devWindow    = nullptr;
+    BOOL                        g_windowed     = TRUE;
+    float                       g_ssaaFactor   = 1.0f;   // supersampling: backbuffer scale (1.0 = off)
+    wxl::gpu::capture::FrameFn  g_frame        = nullptr;
 
-    // Standard IDirect3DDevice9 vtable index of EndScene (BeginScene=41, EndScene=42, Clear=43).
+    // Standard IDirect3DDevice9 vtable indices (Reset=16, Present=17, BeginScene=41, EndScene=42, Clear=43).
+    constexpr int kVtReset    = 16;
+    constexpr int kVtPresent  = 17;
     constexpr int kVtEndScene = 42;
+    using ResetFn    = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
     using EndSceneFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*);
-    EndSceneFn g_origEndScene = nullptr;
+    using PresentFn  = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+    ResetFn    g_origReset     = nullptr;
+    EndSceneFn g_origEndScene  = nullptr;
+    PresentFn  g_origPresent   = nullptr;
+
+    HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp);
 
     /**
      * @brief Invokes the per-frame callback then forwards to the original EndScene.
@@ -43,7 +56,30 @@ namespace
     }
 
     /**
-     * @brief Patches this device instance's EndScene vtable slot to the hook.
+     * @brief Logs the present args + HRESULT for the first frames (windowed present diagnostics).
+     * @param dev    presenting device.
+     * @param src    source rect.
+     * @param dst    destination rect.
+     * @param wnd    destination window override (windowed present).
+     * @param dirty  dirty region.
+     * @return Result of the original Present.
+     */
+    HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty)
+    {
+        // The d3d9on12 windowed (DWM) present does not show the backbuffer, so own the present in windowed
+        // mode: show the frame through our own swapchain and skip the native present. Fullscreen keeps the
+        // native present, which composites correctly.
+        if (g_windowed)
+        {
+            HWND target = wnd ? wnd : g_devWindow;
+            if (target && wxl::gpu::present::Present(dev, target))
+                return S_OK;
+        }
+        return g_origPresent(dev, src, dst, wnd, dirty);
+    }
+
+    /**
+     * @brief Patches this device instance's Present + EndScene vtable slots to the hooks.
      * @param dev  device whose vtable is patched; On12 gives each device its own vtable.
      */
     void PatchEndScene(IDirect3DDevice9* dev)
@@ -54,18 +90,93 @@ namespace
         g_origEndScene = reinterpret_cast<EndSceneFn>(vt[kVtEndScene]);
         vt[kVtEndScene] = reinterpret_cast<void*>(&HookEndScene);
         VirtualProtect(&vt[kVtEndScene], sizeof(void*), old, &old);
+
+        VirtualProtect(&vt[kVtPresent], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+        g_origPresent = reinterpret_cast<PresentFn>(vt[kVtPresent]);
+        vt[kVtPresent] = reinterpret_cast<void*>(&HookPresent);
+        VirtualProtect(&vt[kVtPresent], sizeof(void*), old, &old);
+
+        VirtualProtect(&vt[kVtReset], sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+        g_origReset = reinterpret_cast<ResetFn>(vt[kVtReset]);
+        vt[kVtReset] = reinterpret_cast<void*>(&HookReset);
+        VirtualProtect(&vt[kVtReset], sizeof(void*), old, &old);
     }
 
     /**
-     * @brief Records the engine device on first capture and hooks its EndScene.
-     * @param dev  engine device to capture.
+     * @brief Logs the present parameters a device was created with (windowed present diagnostics).
+     * @param pp  present parameters, may be null.
      */
-    void Capture(IDirect3DDevice9* dev)
+    void LogPresentParams(const D3DPRESENT_PARAMETERS* pp)
     {
-        if (g_device) return;
+        if (!pp) { Log("capture: CreateDevice pp=null"); return; }
+        Log("capture: pp Windowed=%d SwapEffect=%d BBCount=%u %ux%u fmt=%d hDevWnd=%p Flags=0x%X PresentInterval=0x%X",
+            pp->Windowed, (int)pp->SwapEffect, pp->BackBufferCount,
+            pp->BackBufferWidth, pp->BackBufferHeight, (int)pp->BackBufferFormat,
+            pp->hDeviceWindow, pp->Flags, pp->PresentationInterval);
+    }
+
+    /**
+     * @brief Makes windowed present params compatible with the flip-model swapchain On12 must use.
+     *
+     * On12 bridges the D3D9 present to a DXGI flip-model swapchain. Flip-model forbids a lockable backbuffer
+     * and needs at least two buffers, so a windowed device asking for a lockable single-buffer chain (which
+     * the engine does) presents to a surface DWM never composites, leaving the window white. Clearing the
+     * lockable flag and raising the buffer count to two lets the windowed flip-model present reach DWM.
+     * Fullscreen is left untouched (it presents without DWM and already works).
+     * @param pp  present parameters to sanitize in place, may be null.
+     */
+    void SanitizePresentParams(D3DPRESENT_PARAMETERS* pp)
+    {
+        if (!pp || !pp->Windowed) return;
+        const DWORD before = pp->Flags;
+        const UINT  beforeCount = pp->BackBufferCount;
+        pp->Flags &= ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+        if (pp->BackBufferCount < 2) pp->BackBufferCount = 2;
+        if (pp->Flags != before || pp->BackBufferCount != beforeCount)
+            Log("capture: windowed present sanitized (Flags 0x%X->0x%X, BBCount %u->%u)",
+                before, pp->Flags, beforeCount, pp->BackBufferCount);
+
+        // Supersampling is NOT done by enlarging the backbuffer: the windowed On12 backbuffer is pinned to
+        // the window client size (an inflated BackBufferWidth is silently clamped), so the engine would
+        // render the world clipped to a corner. Instead the world pass is redirected into an offscreen 2x
+        // surface inside the world-render detour and downsampled into this native backbuffer (see
+        // runtime/RenderHooks.cpp). The backbuffer stays at native (window) resolution here.
+    }
+
+    /**
+     * @brief Re-sanitizes present params on a device reset (resolution change, mode switch).
+     *
+     * The engine resets the device (it does not recreate it) when the resolution or window mode changes, so
+     * the windowed sanitize and the supersampling scale must be reapplied here, not only at CreateDevice.
+     * @param dev  device being reset.
+     * @param pp   new present parameters, sanitized in place.
+     * @return Result of the original Reset.
+     */
+    HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
+    {
+        SanitizePresentParams(pp);
+        if (pp)
+        {
+            g_windowed = pp->Windowed;
+            if (pp->hDeviceWindow) g_devWindow = pp->hDeviceWindow;
+        }
+        return g_origReset(dev, pp);
+    }
+
+    /**
+     * @brief Records the engine device + its On12 queue on first capture and hooks its EndScene.
+     * @param dev    engine device to capture.
+     * @param queue  the On12 queue the device's factory runs on.
+     */
+    void Capture(IDirect3DDevice9* dev, ID3D12CommandQueue* queue)
+    {
+        if (g_device == dev) return;   // already hooked this device
+        // The engine recreates the device (and its window) on a graphics restart (e.g. /console gxRestart),
+        // giving it a fresh vtable, so re-hook the new device instead of leaving it unhooked (white screen).
         g_device = dev;
+        g_presentQueue = queue;
         PatchEndScene(dev);
-        Log("capture: engine device %p captured, EndScene hooked", dev);
+        Log("capture: engine device %p captured (queue %p), hooks installed", dev, queue);
     }
 
     /**
@@ -80,9 +191,10 @@ namespace
          * @brief Wraps a real factory, optionally with its Ex interface.
          * @param real    real IDirect3D9 factory.
          * @param realEx  real IDirect3D9Ex factory, or null on the non-Ex path.
+         * @param queue   the On12 queue this factory runs on, recorded if it creates the captured device.
          */
-        explicit WrappedD3D9(IDirect3D9* real, IDirect3D9Ex* realEx)
-            : real_(real), realEx_(realEx) {}
+        explicit WrappedD3D9(IDirect3D9* real, IDirect3D9Ex* realEx, ID3D12CommandQueue* queue)
+            : real_(real), realEx_(realEx), queue_(queue) {}
 
         // --- IUnknown ---
         /**
@@ -142,8 +254,12 @@ namespace
          */
         HRESULT STDMETHODCALLTYPE CreateDevice(UINT a, D3DDEVTYPE t, HWND fw, DWORD bf, D3DPRESENT_PARAMETERS* pp, IDirect3DDevice9** ret) override
         {
+            LogPresentParams(pp);
+            SanitizePresentParams(pp);
+            g_devWindow = (pp && pp->hDeviceWindow) ? pp->hDeviceWindow : fw;
+            g_windowed  = pp ? pp->Windowed : TRUE;
             HRESULT hr = real_->CreateDevice(a, t, fw, bf, pp, ret);
-            if (SUCCEEDED(hr) && ret && *ret) Capture(*ret);
+            if (SUCCEEDED(hr) && ret && *ret) Capture(*ret, queue_);
             return hr;
         }
 
@@ -165,30 +281,44 @@ namespace
         HRESULT STDMETHODCALLTYPE CreateDeviceEx(UINT a, D3DDEVTYPE t, HWND fw, DWORD bf, D3DPRESENT_PARAMETERS* pp, D3DDISPLAYMODEEX* fsm, IDirect3DDevice9Ex** ret) override
         {
             if (!realEx_) return E_NOTIMPL;
+            LogPresentParams(pp);
+            SanitizePresentParams(pp);
+            g_devWindow = (pp && pp->hDeviceWindow) ? pp->hDeviceWindow : fw;
+            g_windowed  = pp ? pp->Windowed : TRUE;
             HRESULT hr = realEx_->CreateDeviceEx(a, t, fw, bf, pp, fsm, ret);
-            if (SUCCEEDED(hr) && ret && *ret) Capture(*ret);
+            if (SUCCEEDED(hr) && ret && *ret) Capture(*ret, queue_);
             return hr;
         }
         HRESULT STDMETHODCALLTYPE GetAdapterLUID(UINT a, LUID* luid) override { return realEx_ ? realEx_->GetAdapterLUID(a, luid) : E_NOTIMPL; }
 
     private:
-        IDirect3D9*   real_   = nullptr;
-        IDirect3D9Ex* realEx_ = nullptr;
-        ULONG         ref_    = 1;
+        IDirect3D9*         real_   = nullptr;
+        IDirect3D9Ex*       realEx_ = nullptr;
+        ID3D12CommandQueue* queue_  = nullptr;
+        ULONG               ref_    = 1;
     };
 }
 
 namespace wxl::gpu::capture
 {
-    /** @brief Wraps a real factory for interception. @param real real factory. @return Wrapper, or null if real is null. */
-    IDirect3D9*   Wrap(IDirect3D9* real)     { return real ? new WrappedD3D9(real, nullptr) : nullptr; }
+    /** @brief Wraps a real factory for interception. @param real real factory. @param queue factory's On12 queue. @return Wrapper, or null if real is null. */
+    IDirect3D9*   Wrap(IDirect3D9* real, ID3D12CommandQueue* queue)     { return real ? new WrappedD3D9(real, nullptr, queue) : nullptr; }
 
-    /** @brief Wraps a real Ex factory for interception. @param real real Ex factory. @return Wrapper, or null if real is null. */
-    IDirect3D9Ex* WrapEx(IDirect3D9Ex* real) { return real ? new WrappedD3D9(real, real) : nullptr; }
+    /** @brief Wraps a real Ex factory for interception. @param real real Ex factory. @param queue factory's On12 queue. @return Wrapper, or null if real is null. */
+    IDirect3D9Ex* WrapEx(IDirect3D9Ex* real, ID3D12CommandQueue* queue) { return real ? new WrappedD3D9(real, real, queue) : nullptr; }
 
     /** @brief Registers the per-frame callback. @param fn callback invoked at each EndScene. */
     void              OnFrame(FrameFn fn)    { g_frame = fn; }
 
     /** @brief Returns the captured engine device. @return The device, or null before capture. */
     IDirect3DDevice9* Device()               { return g_device; }
+
+    /** @brief Returns the captured (presenting) device's On12 queue. @return The queue, or null before capture. */
+    ID3D12CommandQueue* PresentQueue()       { return g_presentQueue; }
+
+    /** @brief Sets the supersampling factor (applied on the next device create/reset). @param factor 1.0 = off. */
+    void  SetSsaaFactor(float factor)        { g_ssaaFactor = factor; }
+
+    /** @brief Returns the current supersampling factor. @return The factor (1.0 = off). */
+    float SsaaFactor()                       { return g_ssaaFactor; }
 }

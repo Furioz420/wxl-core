@@ -252,7 +252,7 @@ namespace
     {
         ev::TextureUploadArgs a{ tex, static_cast<uint32_t>(x2 - x), static_cast<uint32_t>(y2 - y) };
         ev::Emit(ev::Event::OnTextureUpload, &a);
-        // *reinterpret_cast<uint32_t*>(gxoff::kMipTableValid) = 0;
+        *reinterpret_cast<uint32_t*>(gxoff::kMipTableValid) = 0;
         g_origTexUpdate(tex, x, y, x2, y2, flag);
     }
 
@@ -351,12 +351,12 @@ namespace
      * only the node that wait is blocked on and leaves the rest, so no nested completion frees or rewrites
      * a buffer the outer build is still uploading from.
      */
-    int __cdecl hkAsyncDrain(int a, int b)
+    int __cdecl hkAsyncDrain()
     {
         if (g_drainDepth > 0)
             return adrain::DrainAwaitedOnly();
         ++g_drainDepth;
-        const int r = g_origAsyncDrain(a, b);
+        const int r = g_origAsyncDrain();
         --g_drainDepth;
         return r;
     }

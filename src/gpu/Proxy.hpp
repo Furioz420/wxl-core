@@ -30,4 +30,10 @@ extern "C"
 
     /** @brief Flushes the D3D12 debug-layer validation messages to the proxy log. */
     __declspec(dllimport) void                WxlD3D12DrainDebug();
+
+    /** @brief Sets the windowed supersampling factor (1.0 = off); applies on the next device create/reset. */
+    __declspec(dllimport) void                WxlSetSsaaFactor(float factor);
+
+    /** @brief Returns the current windowed supersampling factor (1.0 = off). */
+    __declspec(dllimport) float               WxlGetSsaaFactor();
 }

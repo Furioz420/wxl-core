@@ -5,3 +5,5 @@ EXPORTS
     WxlD3D12Device
     WxlD3D12Queue
     WxlD3D12DrainDebug
+    WxlSetSsaaFactor
+    WxlGetSsaaFactor

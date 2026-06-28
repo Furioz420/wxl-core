@@ -92,9 +92,16 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     add_library(d3d9 SHARED ${WXL_GPU_SRC})
     set_target_properties(d3d9 PROPERTIES OUTPUT_NAME "d3d9" PREFIX "")
     target_include_directories(d3d9 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(d3d9 PRIVATE d3d12)
+    target_link_libraries(d3d9 PRIVATE d3d12 dxgi dcomp d3dcompiler)
     target_link_options(d3d9 PRIVATE "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/Proxy.def")
     target_compile_definitions(d3d9 PRIVATE ${WXL_DEFS})
+
+    # Deploy: copy the freshly linked proxy into the client folder after every build.
+    if(CLIENT_PATH)
+        add_custom_command(TARGET d3d9 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:d3d9>" "${CLIENT_PATH}/d3d9.dll"
+            COMMENT "Deploy d3d9.dll -> ${CLIENT_PATH}")
+    endif()
 endif()
 
 # =============================================================================
