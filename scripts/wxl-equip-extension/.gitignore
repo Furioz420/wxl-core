@@ -23,11 +23,6 @@
 *.dll
 *.so.*
 
-
-# Fortran module files
-*.mod
-*.smod
-
 # Compiled Static libraries
 *.lai
 *.la
@@ -68,14 +63,5 @@ vcpkg_installed/
 Testing/
 .cache/
 
-# Scripts folder
-*.*
-./*
-!wxl-equip-extension/
-!wxl-equip-extension/**
-!wxl-modern-blp/
-!wxl-modern-blp/**
-!wxl-modern-m2/
-!wxl-modern-m2/**
-!wxl-modern-render/
-!wxl-modern-render/**
+# session and development notes (local only)
+docs/notes/
