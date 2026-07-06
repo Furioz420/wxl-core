@@ -80,7 +80,7 @@ namespace wxl::host::ipc
 
         const ControlHeader* hdr = ChannelHeader(g_base, i);
         const uint8_t* payload = ChannelPayload(g_base, i);
-        seqOut = hdr->reqSeq;
+        seqOut = hdr->reqSeq; // capture the request's sequence so the response can be stamped with it
         uint32_t n = hdr->reqLen;
         if (n > kChannelPayload) n = 0; // malformed: hand the worker an empty request
         reqOut.assign(payload, payload + n);
@@ -104,7 +104,10 @@ namespace wxl::host::ipc
         if (n > kChannelPayload) n = 0; // never overrun the window; signal a zero-length response
         if (n) memcpy(payload, resp.data(), n);
         hdr->respLen = n;
-        hdr->respSeq = seq; // marks the response complete for the request we copied
+        // Stamp the response with the sequence of the request it answers -- NOT the current reqSeq, which
+        // the client may already have bumped for a newer request after timing this one out. This is what
+        // lets the client reject a late response that belongs to an abandoned request.
+        hdr->respSeq = seq;
         SetEvent(g_respEv[i]);
         return n != 0;
     }

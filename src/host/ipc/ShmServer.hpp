@@ -44,7 +44,7 @@ namespace wxl::host::ipc
     /**
      * @brief Writes the response payload to channel `i` and signals the client.
      * @param i     channel index
-     * @param seq   request sequence this response belongs to
+     * @param seq   request sequence this response belongs to (echoed back so the client can match it)
      * @param resp  response payload bytes
      * @return true if a nonzero-length response was written
      */

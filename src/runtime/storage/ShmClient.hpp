@@ -53,10 +53,15 @@ namespace wxl::runtime::ipc
     /**
      * @brief Result of a host file open.
      *
-     * ok=false: not found. ok && id==0: inline, bytes in inlineData. ok && id!=0: a shared section
-     * the client maps with MapBlob and reads directly; FileReadChunk is the fallback when mapping fails.
+     * Three outcomes, distinguished so callers never confuse a transport failure with a real absence:
+     *  - ok == true: served. id==0 -> inline, bytes in inlineData; id!=0 -> a shared section the client maps
+     *    with MapBlob and reads directly (FileReadChunk is the fallback when mapping fails).
+     *  - ok == false && hostMiss == true: the host answered and reported the file absent (a real, cacheable
+     *    miss -> native fallback is correct).
+     *  - ok == false && hostMiss == false: no usable answer (timeout / desync / bad request). Transient: fall
+     *    back to native for THIS open only, and do NOT cache it -- the next open retries the host.
      */
-    struct FileOpenResult { bool ok; uint32_t id; uint32_t size; std::vector<uint8_t> inlineData; };
+    struct FileOpenResult { bool ok; bool hostMiss; uint32_t id; uint32_t size; std::vector<uint8_t> inlineData; };
 
     /**
      * @brief Opens a file from the host archive set.
