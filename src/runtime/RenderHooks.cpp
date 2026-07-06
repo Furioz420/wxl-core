@@ -23,13 +23,14 @@
 #include "gpu/Proxy.hpp"
 #include "offsets/engine/Gx.hpp"
 #include "offsets/game/M2.hpp"
+#include "structure/m2/M2Format.hpp"
 
 #include <windows.h>
 #include <d3d9.h>
 
-// Uses two device-vtable pointer swaps (DrawIndexedPrimitive, EndScene) and one function-entry hook
-// (the M2 batch draw); no mid-function inline patch, so the world render pass stays intact. The
-// world->UI post-fx slot is served from the EndScene hook instead.
+// Uses device-vtable pointer swaps (DrawIndexedPrimitive, EndScene, Present, SetRenderTarget,
+// SetDepthStencilSurface) and function-entry hooks; no mid-function inline patch, so the world render
+// pass stays intact. The world->UI post-fx slot is served from the render-finalize hook.
 namespace
 {
     namespace off   = wxl::offsets::engine::gx;
@@ -39,20 +40,20 @@ namespace
 
     // The model currently drawing, captured between a batch-draw enter and its DrawIndexedPrimitive.
     void* g_curModel = nullptr;
+    // The current M2 batch draw context; its copied skin-section pointer is populated before the DIP call.
+    void* g_curDrawCtx = nullptr;
     // Re-entrancy guard: a subscriber re-issues the draw through the hooked vtable, so do not re-emit.
     bool  g_inM2Emit = false;
 
-    using DrawBatchFn = void (__fastcall*)(void* ctx, void* edx);
-    using DIPFn       = long (__stdcall*)(void*, int, int, unsigned, unsigned, unsigned, unsigned);
-    using ResetFn     = long (__stdcall*)(void*, D3DPRESENT_PARAMETERS*);
-    using EndSceneFn  = long (__stdcall*)(void*);
-    using PresentFn   = long (__stdcall*)(void*, const void*, const void*, void*, const void*);
+    using DrawBatchFn  = void (__fastcall*)(void* ctx, void* edx);
+    using DIPFn        = long (__stdcall*)(void*, int, int, unsigned, unsigned, unsigned, unsigned);
+    using EndSceneFn   = long (__stdcall*)(void*);
+    using PresentFn    = long (__stdcall*)(void*, const void*, const void*, void*, const void*);
 
-    DrawBatchFn g_origDrawBatch = nullptr;
-    DIPFn       g_origDIP       = nullptr;
-    ResetFn     g_origReset     = nullptr;
-    EndSceneFn  g_origEndScene  = nullptr;
-    PresentFn   g_origPresent   = nullptr;
+    DrawBatchFn  g_origDrawBatch  = nullptr;
+    DIPFn        g_origDIP        = nullptr;
+    EndSceneFn   g_origEndScene   = nullptr;
+    PresentFn    g_origPresent    = nullptr;
     off::WorldRenderFinalizeFn g_origWorldFinalize = nullptr;
     off::LiquidRenderPassFn    g_origLiquidRender  = nullptr;
 
@@ -68,9 +69,49 @@ namespace
      */
     void __fastcall hkDrawBatch(void* ctx, void* edx)
     {
+        void* prevModel = g_curModel;
+        void* prevCtx   = g_curDrawCtx;
         g_curModel = static_cast<off::DrawBatchContext*>(ctx)->model;
+        g_curDrawCtx = ctx;
         g_origDrawBatch(ctx, edx);
-        g_curModel = nullptr;
+        g_curDrawCtx = prevCtx;
+        g_curModel = prevModel;
+    }
+
+    /**
+     * @brief Re-expands modern character skin section index starts before the D3D draw.
+     *
+     * The 3.3.5 M2 draw path truncates M2SkinSection::indexStart to 16 bits when passing StartIndex to
+     * DrawIndexedPrimitive. Retail character skins use section.level as the high 16 bits of the index window.
+     * By the time DIP is called, drawCtx+0x90 points at the copied M2SkinSection for this batch, so the vtable
+     * hook can restore the full 32-bit StartIndex without touching normal legacy sections.
+     */
+    unsigned ExpandM2StartIndex(unsigned startIndex) noexcept
+    {
+        if (!g_curDrawCtx) return startIndex;
+        __try
+        {
+            const auto* ctx = static_cast<const off::DrawBatchContext*>(g_curDrawCtx);
+            const auto* sec = static_cast<const wxl::structure::m2::M2SkinSection*>(ctx->section);
+            if (!sec || sec->level == 0) return startIndex;
+            if ((startIndex & 0xFFFFu) != sec->indexStart) return startIndex;
+            const unsigned expanded = (static_cast<unsigned>(sec->level) << 16) | sec->indexStart;
+            static unsigned logged = 0;
+            if (logged < 16)
+            {
+                ++logged;
+                WLOG_INFO("render: expanded M2 StartIndex %u -> %u (section=%u level=%u count=%u)",
+                          startIndex, expanded,
+                          static_cast<unsigned>(sec->skinSectionId),
+                          static_cast<unsigned>(sec->level),
+                          static_cast<unsigned>(sec->indexCount));
+            }
+            return expanded;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return startIndex;
+        }
     }
 
     /**
@@ -141,54 +182,14 @@ namespace
         if (g_ribbonModern)
             return DrawRibbonMultiTexture(static_cast<IDirect3DDevice9*>(dev), pt, bv, mi, nv, si, pc);
 
-        long r = g_origDIP(dev, pt, bv, mi, nv, si, pc);
+        const unsigned drawStartIndex = ExpandM2StartIndex(si);
+        long r = g_origDIP(dev, pt, bv, mi, nv, drawStartIndex, pc);
         if (g_curModel && !g_inM2Emit)
         {
             g_inM2Emit = true;
-            ev::M2BatchDrawArgs a{ dev, g_curModel, pt, bv, mi, nv, si, pc };
+            ev::M2BatchDrawArgs a{ dev, g_curModel, pt, bv, mi, nv, drawStartIndex, pc };
             ev::Emit(ev::Event::OnM2BatchDraw, &a);
             g_inM2Emit = false;
-        }
-        return r;
-    }
-
-    /**
-     * @brief Detours D3D9 Reset, bracketing device-loss resource teardown/recreate.
-     * @param dev     D3D9 device.
-     * @param params  reset presentation parameters.
-     * @return the Reset result.
-     */
-    long __stdcall hkReset(void* dev, D3DPRESENT_PARAMETERS* params)
-    {
-        static unsigned resetLog = 0;
-        const bool logThis = resetLog < 16;
-        if (logThis)
-        {
-            ++resetLog;
-            WLOG_INFO("render: Reset begin %ux%u windowed=%u",
-                      params ? params->BackBufferWidth : 0,
-                      params ? params->BackBufferHeight : 0,
-                      params ? static_cast<unsigned>(params->Windowed) : 0);
-        }
-
-        ev::DeviceResetArgs a{ dev, params };
-        gx::ReleaseResetResources();
-        ev::Emit(ev::Event::OnDeviceLost, &a);
-
-        const long r = g_origReset(dev, params);
-        if (SUCCEEDED(r))
-        {
-            ev::Emit(ev::Event::OnDeviceReset, &a);
-            if (logThis) WLOG_INFO("render: Reset ok");
-        }
-        else
-        {
-            static unsigned logged = 0;
-            if (logged < 8)
-            {
-                ++logged;
-                WLOG_WARN("render: Reset failed hr=0x%08lX", static_cast<unsigned long>(r));
-            }
         }
         return r;
     }
@@ -207,6 +208,17 @@ namespace
 
     void SsaaArmFrame();   // defined in the supersampling section below; arms the redirect each frame
 
+    // World -> UI boundary coordination, shared by the world-only hook (hkWorldFinalize) and the general
+    // first-UI-quad hook (hkGxDeviceDraw, which also covers the glue screens). OnWorldRenderEnd must fire
+    // exactly once per frame: whichever boundary runs first claims it via g_boundaryFired. In-world the world
+    // hook always wins (it runs before the UI quads); on the glue screens, where the world hook is silent, the
+    // UI-quad hook fires it. g_worldActive records that we are in-world (the world hook fired this frame), so the
+    // SSAA/depth redirect arms only there. All three reset at Present.
+    bool g_boundaryFired = false;   // OnWorldRenderEnd already emitted this frame (once-per-frame latch)
+    bool g_inBoundary    = false;   // re-entrancy guard while emitting the boundary event
+    bool g_worldActive   = false;   // the world hook fired this frame (in-world, not a glue screen)
+    bool g_inGlueRender  = false;   // true while the glue 3D model renders (gates the projection snapshot)
+
     /**
      * @brief Detours Present, emitting OnFrame just before the buffers swap.
      * @param dev    D3D9 device.
@@ -220,202 +232,516 @@ namespace
     {
         ev::FrameArgs a{ dev };
         ev::Emit(ev::Event::OnFrame, &a);
-        // Arm the supersampling redirect for the next frame: the world renders before the world-finalize
+        // Arm the supersampling redirect for the next frame: the world renders before the world->UI
         // boundary, so the SetRenderTarget filter must already be armed when the next frame binds its backbuffer.
+        // SsaaArmFrame reads g_worldActive (set this frame by the world hook) to gate arming to in-world.
         SsaaArmFrame();
+        // Reset the per-frame boundary latches for the coming frame. The next world frame's WorldFinalize re-sets
+        // g_worldActive; on a glue frame it stays false so the redirect never arms there.
+        g_boundaryFired = false;
+        g_worldActive   = false;
         return g_origPresent(dev, src, dst, wnd, dirty);
     }
 
-    // --- World-only supersampling via render-target redirect ------------------------------------------
-    // The windowed On12 backbuffer is pinned to the window client size, so it cannot be enlarged. Instead the
-    // world is redirected into a factor-sized offscreen color+depth surface, then downsampled into the native
-    // backbuffer at the world -> UI boundary; the UI then draws crisp at native resolution. The world renders
-    // EARLY in the frame (before the world-finalize callback) and binds the native backbuffer via
-    // SetRenderTarget, so the redirect is a FILTER on SetRenderTarget(0)/SetDepthStencilSurface, armed from
-    // the previous frame's Present through the world->UI boundary: every native-size backbuffer bind in that
-    // window is swapped to the factor-sized surfaces, and curWindow is scaled so the engine's viewport
-    // follows. At the boundary (world-finalize) the native targets/curWindow are restored for the UI and the
-    // offscreen world is resolved into the native backbuffer in D3D12 by the OnWorldRenderEnd subscriber
-    // (D3D9 StretchRect to the On12 backbuffer is rejected).
-    // (RE: _docs/re_comprehension/335/ssaa_world_render_target.md; approach mirrors the archived
-    // WotLK-Extensions Ssaa SetRenderTarget filter.)
-    using SetRTFn = long (__stdcall*)(void*, unsigned long, void*);
-    using SetDSFn = long (__stdcall*)(void*, void*);
-    SetRTFn g_origSetRT = nullptr;
-    SetDSFn g_origSetDS = nullptr;
-    void*   g_filterDevice = nullptr;                  // device whose vtable currently carries the filters
+    // World-only supersampling. During the world pass the color render target is redirected into a larger
+    // offscreen surface and the engine viewport is scaled, so the world rasterizes at render size; at the
+    // world to UI boundary the offscreen color is downsampled into the backbuffer and the native targets are
+    // restored, so the UI draws at native resolution. The redirect is applied at both the engine render-target
+    // bind and the D3D9 render-target bind. A depth-using post-process (ambient occlusion) needs a sampleable
+    // depth, so the world depth is bound to a shader-readable depth surface that the module reads afterwards.
+    using SetRTFn   = long (__stdcall*)(void*, unsigned long, void*);
+    using SetDSFn   = long (__stdcall*)(void*, void*);
+    using GxSetRTFn = void (__fastcall*)(void*, void*, int, int, int);
+    using ResetFn   = long (__stdcall*)(void*, D3DPRESENT_PARAMETERS*);
+    SetRTFn   g_origSetRT    = nullptr;
+    SetDSFn   g_origSetDS    = nullptr;
+    GxSetRTFn g_origGxSetRT  = nullptr;
+    ResetFn   g_origReset    = nullptr;
+    off::GxSetProjectionFn g_origGxSetProjection = nullptr;  // engine projection-upload trampoline (observer)
+    off::GlueModelRenderFn g_origGlueModelRender = nullptr;  // CSimpleModelFFX::Render trampoline (glue boundary)
+    void*     g_hookedDevice = nullptr;                // device whose vtable currently carries the render hooks
 
-    // The world depth is an INTZ texture (a depth-stencil that is ALSO shader-readable) so depth-using
-    // post-process effects (SSAO) can sample it after the world pass. INTZ is single-sample only.
+    // A depth-stencil that is also shader-readable, single-sample only.
     const D3DFORMAT    kFmtINTZ = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
-    IDirect3DSurface9* g_ssaaColor = nullptr;          // factor-sized world color render target
-    IDirect3DTexture9* g_ssaaDepthTex = nullptr;       // factor-sized INTZ depth texture (sampleable)
-    IDirect3DSurface9* g_ssaaDepth = nullptr;          // its level-0 surface, bound as the world depth-stencil
-    void*              g_ssaaDevice = nullptr;         // device the offscreen surfaces belong to
-    UINT g_ssaaNativeW = 0, g_ssaaNativeH = 0;         // native backbuffer size the redirect matches
-    UINT g_ssaa2xW = 0, g_ssaa2xH = 0;                 // offscreen (supersampled) size
-    bool g_ssaaRedirect = false;                       // armed: native-size bb binds redirect to the 2x color
+    IDirect3DTexture9* g_ssaaColorTex  = nullptr;      // render-size world color TEXTURE (supersampling on)
+    IDirect3DSurface9* g_ssaaColor     = nullptr;      // its level-0 surface, bound as the world render target
+    IDirect3DTexture9* g_worldDepthTex = nullptr;      // render-size sampleable depth texture
+    IDirect3DSurface9* g_worldDepth    = nullptr;      // its level-0 surface, bound as the world depth-stencil
+    void*              g_targetDevice  = nullptr;      // device the offscreen surfaces belong to
+    UINT g_nativeW = 0, g_nativeH = 0;                 // native backbuffer size
+    UINT g_renderW = 0, g_renderH = 0;                 // offscreen render size (native * renderScale)
+    bool g_hasColor = false;                           // a color render target exists (supersampling on)
+    bool g_readableDepth = false;                      // the depth is the sampleable format vs a plain depth-stencil
+    bool g_colorRedirect = false;                      // armed: redirect the color bind to g_ssaaColor
+    bool g_depthRedirect = false;                      // armed: redirect the depth bind to g_worldDepth
+    bool g_depthNeeded   = false;                      // a depth-using effect is enabled (set by the module)
+
+    // Glue scene projection snapshot. The glue 3D camera is not in the world camera globals (those stay
+    // identity on the glue screens), so the engine projection upload is observed during the glue model render
+    // (hkGxSetProjection) and the perspective matrix captured here, then handed through OnWorldRenderEnd to a
+    // depth-using effect (ambient occlusion). Row-major float[16], same layout as the world camera projection.
+    float g_glueProj[16]  = {};
+    bool  g_glueProjValid = false;
 
     /** @brief gx graphics-device object base, or null. */
     uint8_t* GxBase() { return reinterpret_cast<uint8_t*>(*reinterpret_cast<void**>(off::kGxDevicePtr)); }
 
     /** @brief True when a surface matches the native backbuffer size (so it should be redirected). */
-    bool SsaaIsNativeSize(IDirect3DSurface9* s)
+    bool IsNativeSize(IDirect3DSurface9* s)
     {
         if (!s) return false;
         D3DSURFACE_DESC d{};
-        return SUCCEEDED(s->GetDesc(&d)) && d.Width == g_ssaaNativeW && d.Height == g_ssaaNativeH;
+        return SUCCEEDED(s->GetDesc(&d)) && d.Width == g_nativeW && d.Height == g_nativeH;
     }
 
-    /** @brief SetRenderTarget filter: while armed, swaps a native-size backbuffer bind for the 2x color. */
+    /** @brief Redirects a native-size color bind to the render-size color target and scales the viewport. */
     long __stdcall hkSetRenderTarget(void* dev, unsigned long index, void* surface)
     {
         void* use = surface;
-        if (g_ssaaRedirect && index == 0 && g_ssaaColor && SsaaIsNativeSize(static_cast<IDirect3DSurface9*>(surface)))
+        if (g_colorRedirect && index == 0 && g_ssaaColor && IsNativeSize(static_cast<IDirect3DSurface9*>(surface)))
         {
             use = g_ssaaColor;
-            // Bind the 2x depth BEFORE the 2x color: D3D9 requires the depth-stencil to be >= the render
-            // target, so a transient 2x-RT-with-1x-depth (if the engine set RT before depth) would fault.
-            if (g_ssaaDepth) g_origSetDS(dev, g_ssaaDepth);
+            // Bind the render-size depth BEFORE the render-size color: D3D9 validates a new render target against
+            // the currently-bound depth-stencil, and a 2x color over a native (1x) depth makes it reject/unbind
+            // the depth, so the world would render with no depth test (all geometry culled -> black).
+            if (g_worldDepth) g_origSetDS(dev, g_worldDepth);
             if (uint8_t* base = GxBase())
             {
-                *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_ssaa2xW;
-                *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_ssaa2xH;
+                *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_renderW;
+                *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_renderH;
                 *reinterpret_cast<int*>(base + off::kViewportDirty)     = 1;
             }
         }
         return g_origSetRT(dev, index, use);
     }
 
-    /** @brief SetDepthStencilSurface filter: while armed, swaps a native-size depth for the 2x depth. */
+    /** @brief Redirects a native-size depth bind to the render-size depth surface. */
     long __stdcall hkSetDepthStencil(void* dev, void* surface)
     {
         void* use = surface;
-        if (g_ssaaRedirect && g_ssaaDepth && SsaaIsNativeSize(static_cast<IDirect3DSurface9*>(surface)))
-            use = g_ssaaDepth;
+        if (g_depthRedirect && g_worldDepth && IsNativeSize(static_cast<IDirect3DSurface9*>(surface)))
+            use = g_worldDepth;
         return g_origSetDS(dev, use);
     }
 
-    /** @brief Releases the offscreen world surfaces. */
-    void SsaaReleaseTargets()
+    /**
+     * @brief Engine render-target bind, hooked as a pure observer. Supersampling is redirected ONLY through the
+     *        D3D9 SetRenderTarget filter (the engine's own SetRenderTarget internally calls the hooked D3D9 bind,
+     *        which hkSetRenderTarget redirects); an additional engine-level override here corrupted the engine's
+     *        internal render-target state and broke the world render, so this bind is left untouched -- matching
+     *        the known-good standalone build, whose engine-level hook is observer-only too. Kept hooked so the
+     *        trampoline stays available if an effect ever needs to watch engine target switches.
+     * @param self  graphics-device instance.
+     * @param edx   unused register slot for the thiscall convention.
+     * @param slot  render-target slot.
+     * @param rt    engine render-target handle.
+     * @param face  cube face.
+     */
+    void __fastcall hkGxSetRT(void* self, void* edx, int slot, int rt, int face)
     {
-        if (g_ssaaColor)    { g_ssaaColor->Release();    g_ssaaColor = nullptr; }
-        if (g_ssaaDepth)    { g_ssaaDepth->Release();    g_ssaaDepth = nullptr; }
-        if (g_ssaaDepthTex) { g_ssaaDepthTex->Release(); g_ssaaDepthTex = nullptr; }
-        g_ssaaNativeW = g_ssaaNativeH = g_ssaa2xW = g_ssaa2xH = 0;
-        g_ssaaDevice = nullptr;
+        g_origGxSetRT(self, edx, slot, rt, face);
+        (void)slot; (void)rt; (void)face; (void)edx;
     }
 
-    /** @brief Creates (or recreates on device/size change) the offscreen world color RT + INTZ depth. */
-    bool SsaaEnsureTargets(IDirect3DDevice9* dev, UINT nativeW, UINT nativeH, float factor, D3DFORMAT colorFmt)
+    /**
+     * @brief Engine projection-upload bind, hooked as a pure observer. The camera setup uploads its perspective
+     *        projection through this device slot; the world render keeps reading the live world camera global,
+     *        but the GLUE 3D camera never lands in that global (it stays identity on the glue screens), so the
+     *        glue model's projection is snapshotted here while the glue render is in flight (g_inGlueRender),
+     *        filtered to perspective uploads (proj[11] ~ 1; the restore-to-ortho upload at the model draw's end
+     *        has proj[11] == 0 and is skipped). A depth-using effect (ambient occlusion) on the glue screens
+     *        then gets the real matrix through OnWorldRenderEnd.
+     * @param self    graphics-device instance.
+     * @param edx     unused register slot for the thiscall convention.
+     * @param proj16  the projection being uploaded: a row-major float[16].
+     */
+    void __fastcall hkGxSetProjection(void* self, void* edx, const void* proj16)
     {
-        if (g_ssaaColor && g_ssaaDepth && g_ssaaDevice == dev && g_ssaaNativeW == nativeW && g_ssaaNativeH == nativeH)
+        g_origGxSetProjection(self, edx, proj16);
+        if (g_inGlueRender && proj16)
+        {
+            const float* p = static_cast<const float*>(proj16);
+            if (p[11] > 0.5f)   // perspective (w=z term is 1.0); skip ortho / identity uploads
+            {
+                for (int i = 0; i < 16; ++i) g_glueProj[i] = p[i];
+                g_glueProjValid = true;
+            }
+        }
+        (void)edx;
+    }
+
+    /** @brief Releases the offscreen world surfaces. */
+    void ReleaseTargets()
+    {
+        if (g_ssaaColor)     { g_ssaaColor->Release();     g_ssaaColor = nullptr; }
+        if (g_ssaaColorTex)  { g_ssaaColorTex->Release();  g_ssaaColorTex = nullptr; }
+        if (g_worldDepth)    { g_worldDepth->Release();    g_worldDepth = nullptr; }
+        if (g_worldDepthTex) { g_worldDepthTex->Release(); g_worldDepthTex = nullptr; }
+        g_nativeW = g_nativeH = g_renderW = g_renderH = 0;
+        g_hasColor = g_readableDepth = false;
+        g_targetDevice = nullptr;
+    }
+
+    /**
+     * @brief Creates (or recreates on change) the world depth (INTZ + sampleable when readable, else a plain
+     *        depth-stencil) plus the color render target when makeColor (supersampling). Render size =
+     *        native * renderScale. Supersampling alone uses a plain depth; INTZ is created only when a depth
+     *        effect needs to sample it.
+     */
+    bool EnsureTargets(IDirect3DDevice9* dev, UINT nativeW, UINT nativeH, float renderScale, bool makeColor, bool readable, D3DFORMAT colorFmt, D3DFORMAT depthFmt)
+    {
+        const UINT rw = (UINT)(nativeW * renderScale + 0.5f);
+        const UINT rh = (UINT)(nativeH * renderScale + 0.5f);
+        if (g_worldDepth && g_targetDevice == dev && g_nativeW == nativeW && g_nativeH == nativeH &&
+            g_renderW == rw && g_renderH == rh && g_hasColor == makeColor && g_readableDepth == readable)
             return true;
-        SsaaReleaseTargets();
-        const UINT w = (UINT)(nativeW * factor + 0.5f);
-        const UINT h = (UINT)(nativeH * factor + 0.5f);
-        if (FAILED(dev->CreateRenderTarget(w, h, colorFmt, D3DMULTISAMPLE_NONE, 0, FALSE, &g_ssaaColor, nullptr)))
+        ReleaseTargets();
+        if (readable)
         {
-            WLOG_WARN("ssaa: CreateRenderTarget %ux%u fmt=%d failed", w, h, (int)colorFmt);
-            SsaaReleaseTargets();
+            // INTZ: a depth-stencil the world writes AND a shader-readable texture the AO samples.
+            if (FAILED(dev->CreateTexture(rw, rh, 1, D3DUSAGE_DEPTHSTENCIL, kFmtINTZ, D3DPOOL_DEFAULT, &g_worldDepthTex, nullptr)) || !g_worldDepthTex ||
+                FAILED(g_worldDepthTex->GetSurfaceLevel(0, &g_worldDepth)) || !g_worldDepth)
+            {
+                WLOG_WARN("ssaa: INTZ depth %ux%u failed", rw, rh);
+                ReleaseTargets();
+                return false;
+            }
+        }
+        else if (FAILED(dev->CreateDepthStencilSurface(rw, rh, depthFmt, D3DMULTISAMPLE_NONE, 0, FALSE, &g_worldDepth, nullptr)) || !g_worldDepth)
+        {
+            WLOG_WARN("ssaa: CreateDepthStencilSurface %ux%u fmt=%d failed", rw, rh, (int)depthFmt);
+            ReleaseTargets();
             return false;
         }
-        // INTZ depth texture: a depth-stencil the world writes AND a shader-readable texture the AO samples.
-        if (FAILED(dev->CreateTexture(w, h, 1, D3DUSAGE_DEPTHSTENCIL, kFmtINTZ, D3DPOOL_DEFAULT, &g_ssaaDepthTex, nullptr)) || !g_ssaaDepthTex)
+        // Color as a plain render-target surface (CreateRenderTarget), matching the known-good standalone
+        // implementation: the world renders into it AND the post-process samples it through On12's unwrap. The
+        // earlier D3DUSAGE_RENDERTARGET *texture* made On12 hand the module an empty (black) resource; a plain
+        // render-target surface unwraps to the resource the world actually drew into and samples correctly.
+        if (makeColor &&
+            (FAILED(dev->CreateRenderTarget(rw, rh, colorFmt, D3DMULTISAMPLE_NONE, 0, FALSE, &g_ssaaColor, nullptr)) || !g_ssaaColor))
         {
-            WLOG_WARN("ssaa: CreateTexture INTZ %ux%u failed", w, h);
-            SsaaReleaseTargets();
+            WLOG_WARN("ssaa: color render target %ux%u fmt=%d failed", rw, rh, (int)colorFmt);
+            ReleaseTargets();
             return false;
         }
-        if (FAILED(g_ssaaDepthTex->GetSurfaceLevel(0, &g_ssaaDepth)) || !g_ssaaDepth)
-        {
-            WLOG_WARN("ssaa: INTZ GetSurfaceLevel failed");
-            SsaaReleaseTargets();
-            return false;
-        }
-        g_ssaaDevice = dev;
-        g_ssaaNativeW = nativeW; g_ssaaNativeH = nativeH;
-        g_ssaa2xW = w; g_ssaa2xH = h;
-        WLOG_INFO("ssaa: offscreen world target %ux%u (native %ux%u) color=%d depth=INTZ", w, h, nativeW, nativeH, (int)colorFmt);
+        g_targetDevice = dev;
+        g_nativeW = nativeW; g_nativeH = nativeH;
+        g_renderW = rw; g_renderH = rh;
+        g_hasColor = makeColor;
+        g_readableDepth = readable;
+        WLOG_INFO("ssaa: targets %ux%u (native %ux%u) color=%d depth=%s", rw, rh, nativeW, nativeH, makeColor ? (int)colorFmt : -1, readable ? "INTZ" : "plain");
         return true;
     }
 
-    /** @brief Installs (or re-installs after a device recreate) the SetRenderTarget/SetDepthStencil filters. */
-    void SsaaEnsureFilters(IDirect3DDevice9* dev);   // defined after SwapVtbl
+    /** @brief Installs (or re-installs after a device recreate) all render vtable hooks on the live device. */
+    void EnsureDeviceHooks(IDirect3DDevice9* dev);   // defined after SwapVtbl
 
     /**
-     * @brief Frame start (called from Present): arms the redirect for the coming frame's world when
-     *        supersampling is on, after making sure the filters and offscreen surfaces are ready. The world
-     *        renders before the world-finalize boundary, so the redirect must already be armed here.
+     * @brief Per-frame setup, called at present for the coming frame: ensures the offscreen surfaces exist and
+     *        arms the redirect flags. Supersampling redirects the color into a render-size surface and uses a
+     *        render-size depth; a depth-using effect alone keeps the native color and uses a native-size
+     *        sampleable depth. The depth is the sampleable format when a depth-using effect is enabled.
      */
     void SsaaArmFrame()
     {
-        if (WxlGetSsaaFactor() <= 1.01f) { g_ssaaRedirect = false; return; }
+        const float factor  = WxlGetSsaaFactor();
+        const bool  ssaaOn  = factor > 1.01f;
+        // The SSAA/depth redirect is in-world ONLY: it relies on the world pass clearing + rendering into the
+        // offscreen and on the world hook resolving it back. The glue screens (login / character select) have no
+        // such world pass, so redirecting there would send the glue 3D into the offscreen with nothing to resolve
+        // it (black screen). g_worldActive (set by the world hook this frame) gates it. Post-process AA still runs
+        // on glue via the general UI-quad boundary, sampling the backbuffer directly.
+        const bool  active  = (ssaaOn || g_depthNeeded) && g_worldActive;
+        if (!active) { g_colorRedirect = g_depthRedirect = false; return; }
+
         IDirect3DDevice9* dev = static_cast<IDirect3DDevice9*>(gx::RawDevice());
         uint8_t* base = GxBase();
-        if (!dev || !base) { g_ssaaRedirect = false; return; }
-        SsaaEnsureFilters(dev);
+        if (!dev || !base) { g_colorRedirect = g_depthRedirect = false; return; }
+        EnsureDeviceHooks(dev);
 
         IDirect3DSurface9* bb = nullptr;
-        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) { g_ssaaRedirect = false; return; }
+        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) { g_colorRedirect = g_depthRedirect = false; return; }
         D3DSURFACE_DESC cd{};
         bb->GetDesc(&cd);
         bb->Release();
 
-        g_ssaaRedirect = SsaaEnsureTargets(dev, cd.Width, cd.Height, WxlGetSsaaFactor(), cd.Format);
+        // Engine MSAA: the redirect is incompatible -- a single-sample offscreen color (supersampling) or a
+        // single-sample readable depth (ambient occlusion) cannot pair with a multisampled world target, and the
+        // post-process passes multisampled frames through untouched. Leave the native targets in place so the
+        // engine's own multisampling is the anti-aliasing.
+        if (cd.MultiSampleType != D3DMULTISAMPLE_NONE)
+        {
+            g_colorRedirect = g_depthRedirect = false;
+            return;
+        }
+
+        // Plain depth format taken from the native depth surface (ignored when the sampleable format is used).
+        D3DFORMAT depthFmt = D3DFMT_D24X8;
+        if (IDirect3DSurface9* nd = *reinterpret_cast<IDirect3DSurface9**>(base + off::kDepthSurfaceField))
+        {
+            D3DSURFACE_DESC dd{};
+            if (SUCCEEDED(nd->GetDesc(&dd))) depthFmt = dd.Format;
+        }
+
+        // Color is redirected only for supersampling; a depth-only frame keeps the native color and redirects
+        // the depth alone. The depth uses the sampleable format when a depth-using effect is enabled.
+        const bool  makeColor   = ssaaOn;
+        const bool  readable    = g_depthNeeded;
+        const float renderScale = ssaaOn ? factor : 1.0f;
+        if (!EnsureTargets(dev, cd.Width, cd.Height, renderScale, makeColor, readable, cd.Format, depthFmt))
+        {
+            g_colorRedirect = g_depthRedirect = false;
+            return;
+        }
+        g_colorRedirect = makeColor;
+        g_depthRedirect = true;
+
+        // Actively bind the offscreen targets NOW for the coming frame -- this is the piece the known-good
+        // standalone build had (Ssaa::Arm) that a catch-the-bind redirect alone lacks. The engine does not
+        // reliably re-issue a native-size backbuffer SetRenderTarget at the world-pass start, so without an
+        // active bind the world keeps rendering into the real backbuffer and g_ssaaColor stays empty (and the
+        // resolve then clobbers the good backbuffer with that empty surface -> black both ways). Binding here
+        // makes the offscreen the current target before the next frame's clear and world draw; the engine's own
+        // frame clear then lands on the offscreen (so there is no stale-depth cull and no separate clear is
+        // needed). The D3D9 render-target / depth filters still catch any engine re-bind mid-pass and keep it
+        // redirected to the offscreen.
+        if (g_origSetRT && makeColor && g_ssaaColor)
+        {
+            g_origSetRT(dev, 0, g_ssaaColor);
+            if (g_origSetDS && g_worldDepth) g_origSetDS(dev, g_worldDepth);
+            // Clear the offscreen color + depth for the coming frame (defensive: the engine also clears it, but
+            // this guarantees a clean start independent of engine state).
+            dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
+            *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_renderW;
+            *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_renderH;
+            *reinterpret_cast<int*>(base + off::kViewportDirty)     = 1;
+        }
+        else if (g_origSetDS && g_worldDepth)
+        {
+            // Depth-only (a depth effect without supersampling): keep the native color, bind the readable depth.
+            g_origSetDS(dev, g_worldDepth);
+        }
     }
 
     /**
      * @brief Detours world-frame finalize: the world -> UI boundary. When the redirect was armed this frame
-     *        the world has rendered into the offscreen surfaces; here the redirect is disarmed, the native
-     *        render target / depth / curWindow restored for the UI, and OnWorldRenderEnd fired so the
-     *        post-process pass downsamples the offscreen world into the native backbuffer.
+     *        the world has rendered into the offscreen surfaces; here the render-size world color is resolved
+     *        (downsampled) onto the native backbuffer, the redirect is disarmed, the native render target /
+     *        depth / curWindow are restored for the UI, then OnWorldRenderEnd is fired. A depth-using effect
+     *        (ambient occlusion) gets the sampleable world depth through the event for a module-side D3D12 pass.
      * @param worldFrame  world frame being finalized.
      */
     void __cdecl hkWorldFinalize(void* worldFrame)
     {
-        // Keep the filters installed on the live device even if the vtable-based Present hook (which arms the
-        // redirect) was dropped by a gxRestart device recreate; this minhook entry survives the recreate.
-        if (WxlGetSsaaFactor() > 1.01f)
-            if (IDirect3DDevice9* dev = static_cast<IDirect3DDevice9*>(gx::RawDevice()))
-                SsaaEnsureFilters(dev);
+        // Re-install the render vtable hooks on the live device (survives a device recreate).
+        if (IDirect3DDevice9* d = static_cast<IDirect3DDevice9*>(gx::RawDevice()))
+            EnsureDeviceHooks(d);
 
         g_origWorldFinalize(worldFrame);
 
-        const bool ssaa = g_ssaaRedirect;
-        if (ssaa)
+        // In-world: claim the once-per-frame boundary so the general UI-quad hook (hkGxDeviceDraw) no-ops this
+        // frame, and mark that we are in-world so SsaaArmFrame may arm the redirect for the next frame.
+        g_boundaryFired = true;
+        g_worldActive   = true;
+
+        // World to UI boundary. Resolve the render-size world color onto the native backbuffer, then disarm the
+        // redirect and restore the native render target, depth, and viewport so the UI draws at native resolution.
+        const bool colorR = g_colorRedirect;
+        const bool depthR = g_depthRedirect;
+        if (colorR || depthR)
         {
-            g_ssaaRedirect = false;   // UI binds from here on pass through to the native backbuffer
+            g_colorRedirect = g_depthRedirect = false;
             IDirect3DDevice9* dev  = static_cast<IDirect3DDevice9*>(gx::RawDevice());
             uint8_t*          base = GxBase();
-            if (dev)
+            if (dev && colorR)
             {
                 IDirect3DSurface9* bb = nullptr;
                 if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
                 {
+                    // Resolve the render-size world color down onto the native backbuffer. A linear-filtered
+                    // StretchRect from the 2x surface is the supersampling box-downsample (a 2x2 average for an
+                    // integer 2x factor); the On12 proxy handles this surface->backbuffer blit reliably. The UI
+                    // then draws at native resolution over the resolved frame.
+                    dev->StretchRect(g_ssaaColor, nullptr, bb, nullptr, D3DTEXF_LINEAR);
                     g_origSetRT(dev, 0, bb);
                     bb->Release();
                 }
-                if (base)
-                    if (IDirect3DSurface9* nd = *reinterpret_cast<IDirect3DSurface9**>(base + off::kDepthSurfaceField))
-                        g_origSetDS(dev, nd);
             }
-            if (base)
+            if (dev && depthR && base)
+                if (IDirect3DSurface9* nd = *reinterpret_cast<IDirect3DSurface9**>(base + off::kDepthSurfaceField))
+                    g_origSetDS(dev, nd);
+            if (colorR && base)
             {
-                *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_ssaaNativeW;
-                *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_ssaaNativeH;
+                *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_nativeW;
+                *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_nativeH;
                 *reinterpret_cast<int*>(base + off::kViewportDirty)     = 1;
             }
         }
 
-        // The OnWorldRenderEnd subscriber downsamples the offscreen world surface into the native backbuffer
-        // through On12 (D3D9 StretchRect to the backbuffer is rejected), then runs the post-process effects.
-        // depthSource = the readable INTZ world depth for depth-using effects (SSAO).
+        // The core already resolved supersampling onto the backbuffer (the StretchRect above), so the module is
+        // handed a null supersample source for plain SSAA -- it has nothing to do. depthSource is the sampleable
+        // world depth, passed when a depth-using effect (ambient occlusion) asked for it, so the module can run
+        // its D3D12 pass. (A post-process AA effect -- FXAA / CMAA / SMAA -- will instead take over the resolve:
+        // the core hands it g_ssaaColor and skips the StretchRect, so the shader does the downsample + AA.)
         ev::WorldRenderEndArgs a{ gx::RawDevice(),
-                                  ssaa ? static_cast<void*>(g_ssaaColor) : nullptr,
-                                  ssaa ? WxlGetSsaaFactor() : 1.0f,
-                                  ssaa ? static_cast<void*>(g_ssaaDepth) : nullptr };
+                                  nullptr,
+                                  colorR ? WxlGetSsaaFactor() : 1.0f,
+                                  (depthR && g_readableDepth) ? static_cast<void*>(g_worldDepth) : nullptr,
+                                  nullptr };   // in-world the subscriber reads the live world camera projection
         ev::Emit(ev::Event::OnWorldRenderEnd, &a);
+    }
+
+    /**
+     * @brief Arms the redirect for the glue 3D scene (login / character-select model preview), the glue-side
+     *        analogue of SsaaArmFrame + the world arm. CSimpleModelFFX::Render binds no render target of its own
+     *        and drives its viewport through the engine curWindow rect (the same path the world uses), so binding
+     *        the offscreen here and scaling curWindow makes the glue scene rasterize at render size; GlueResolve
+     *        resolves it back at the boundary. Two independent arms, like the world:
+     *          - supersampling (factor > 1): redirect the color into a render-size offscreen + scale curWindow.
+     *            Unlike the world (which clears the whole frame into the offscreen), the glue pass renders the
+     *            model into a sub-rect with no full-frame clear, so the current backbuffer is copied (upscaled)
+     *            into the offscreen first, and the full-frame resolve preserves the 2D backdrop.
+     *          - depth-using effect (ambient occlusion): bind a sampleable INTZ depth (render-size with
+     *            supersampling, else native) so the glue model writes a depth the module can sample.
+     *        Sets g_colorRedirect / g_depthRedirect. Returns true when anything was armed (no engine MSAA).
+     */
+    bool GlueArm()
+    {
+        const float factor = WxlGetSsaaFactor();
+        const bool  ssaaOn = factor > 1.01f;
+        if (!ssaaOn && !g_depthNeeded) return false;   // nothing to do: plain post-process AA samples the bb
+
+        IDirect3DDevice9* dev  = static_cast<IDirect3DDevice9*>(gx::RawDevice());
+        uint8_t*          base = GxBase();
+        if (!dev || !base) return false;
+        EnsureDeviceHooks(dev);
+
+        IDirect3DSurface9* bb = nullptr;
+        if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return false;
+        D3DSURFACE_DESC cd{};
+        bb->GetDesc(&cd);
+        // Engine MSAA: a single-sample offscreen / readable depth cannot pair with a multisampled target.
+        if (cd.MultiSampleType != D3DMULTISAMPLE_NONE) { bb->Release(); return false; }
+
+        D3DFORMAT depthFmt = D3DFMT_D24X8;
+        if (IDirect3DSurface9* nd = *reinterpret_cast<IDirect3DSurface9**>(base + off::kDepthSurfaceField))
+        {
+            D3DSURFACE_DESC dd{};
+            if (SUCCEEDED(nd->GetDesc(&dd))) depthFmt = dd.Format;
+        }
+
+        const bool  makeColor   = ssaaOn;        // color offscreen only for supersampling
+        const bool  readable    = g_depthNeeded; // sampleable INTZ depth only for a depth-using effect
+        const float renderScale = ssaaOn ? factor : 1.0f;
+        if (!EnsureTargets(dev, cd.Width, cd.Height, renderScale, makeColor, readable, cd.Format, depthFmt))
+        {
+            bb->Release();
+            return false;
+        }
+
+        g_colorRedirect = makeColor;
+        g_depthRedirect = true;
+        if (makeColor && g_ssaaColor)
+        {
+            // Supersampling: seed the offscreen with the current backbuffer (upscaled) so the 2D backdrop drawn
+            // before the model survives the full-frame resolve, then bind the offscreen + render-size depth and
+            // scale curWindow so the glue scene rasterizes at render size.
+            dev->StretchRect(bb, nullptr, g_ssaaColor, nullptr, D3DTEXF_LINEAR);
+            g_origSetRT(dev, 0, g_ssaaColor);
+            if (g_worldDepth) g_origSetDS(dev, g_worldDepth);
+            *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_renderW;
+            *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_renderH;
+            *reinterpret_cast<int*>(base + off::kViewportDirty)     = 1;
+        }
+        else if (g_worldDepth)
+        {
+            // Depth-only (ambient occlusion without supersampling): keep the native color, bind the readable
+            // depth so the glue model writes a sampleable depth; the color is untouched.
+            g_origSetDS(dev, g_worldDepth);
+        }
+        bb->Release();
+        return true;
+    }
+
+    /**
+     * @brief Resolves the glue redirect and restores the native render target / depth / viewport -- the
+     *        glue-side analogue of the resolve block in hkWorldFinalize. Called only when GlueArm armed.
+     * @param color  true when the color was redirected into the offscreen (supersampling): downsample it back.
+     */
+    void GlueResolve(bool color)
+    {
+        IDirect3DDevice9* dev  = static_cast<IDirect3DDevice9*>(gx::RawDevice());
+        uint8_t*          base = GxBase();
+        g_colorRedirect = g_depthRedirect = false;
+        if (!dev) return;
+
+        if (color)
+        {
+            IDirect3DSurface9* bb = nullptr;
+            if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb)
+            {
+                dev->StretchRect(g_ssaaColor, nullptr, bb, nullptr, D3DTEXF_LINEAR);
+                g_origSetRT(dev, 0, bb);
+                bb->Release();
+            }
+        }
+        // Restore the native depth (bound for both the supersampling and depth-only arms). The module still
+        // unwraps the INTZ surface directly, so it does not need it bound as the D3D9 depth-stencil afterward.
+        if (base)
+        {
+            if (IDirect3DSurface9* nd = *reinterpret_cast<IDirect3DSurface9**>(base + off::kDepthSurfaceField))
+                g_origSetDS(dev, nd);
+            if (color)
+            {
+                *reinterpret_cast<float*>(base + off::kCurWindowWidth)  = (float)g_nativeW;
+                *reinterpret_cast<float*>(base + off::kCurWindowHeight) = (float)g_nativeH;
+                *reinterpret_cast<int*>(base + off::kViewportDirty)     = 1;
+            }
+        }
+    }
+
+    /**
+     * @brief CSimpleModelFFX::Render inline hook: the GLUE world -> UI boundary, the glue-side analogue of the
+     *        world-only hkWorldFinalize. The engine defers every 3D render into a per-frame-object callback, so
+     *        there is no single global "3D done" point: the world hook covers the world, this covers the glue
+     *        model (login / character-select preview). The boundary fires AFTER the model renders (its 3D is on
+     *        the backbuffer, the glue UI not yet drawn), once per frame via the shared latch. In-world this also
+     *        runs for 3D UI portraits, but the world hook already claimed the boundary, so it is a no-op there.
+     *        GlueArm/GlueResolve bracket the model render: supersampling rasterizes the glue 3D into the
+     *        render-size offscreen and downsamples it back, and a depth-using effect gets a sampleable glue
+     *        depth. The glue camera's projection is snapshotted during the render (hkGxSetProjection, gated by
+     *        g_inGlueRender) and handed to the effect through the event, since the glue camera is not in the
+     *        world camera globals. The post-process then runs on the resolved native backbuffer.
+     * @param frame  the CSimpleModelFFX frame being rendered (passed through; the redirect is bound around it).
+     */
+    void __cdecl hkGlueModelRender(void* frame)
+    {
+        // Claim the once-per-frame boundary up front so the arm/resolve pair brackets exactly the first glue
+        // 3D callback of the frame (a glue frame can run several; only the first is the world->UI boundary).
+        const bool claim = !g_boundaryFired && !g_inBoundary;
+        bool armedColor = false, armedDepth = false;
+        if (claim && GlueArm()) { armedColor = g_colorRedirect; armedDepth = g_depthRedirect; }
+
+        // Observe the glue projection upload only for this claiming render, captured fresh each frame.
+        if (claim) { g_glueProjValid = false; g_inGlueRender = true; }
+        g_origGlueModelRender(frame);   // render the glue 3D model (into the offscreen / readable depth when armed)
+        if (claim) g_inGlueRender = false;
+
+        if (claim)
+        {
+            g_boundaryFired = true;
+            g_inBoundary    = true;
+            if (armedColor || armedDepth) GlueResolve(armedColor);
+            // Supersampling is resolved here (StretchRect), so superSampleSource is null. depthSource is the
+            // sampleable glue depth when a depth-using effect armed it; proj is the snapshotted glue projection
+            // (the world camera globals are identity on glue), used by the module in place of the live camera.
+            void*        depth = (armedDepth && g_readableDepth) ? static_cast<void*>(g_worldDepth) : nullptr;
+            const float* proj  = (armedDepth && g_glueProjValid) ? g_glueProj : nullptr;
+            ev::WorldRenderEndArgs a{ gx::RawDevice(), nullptr,
+                                      armedColor ? WxlGetSsaaFactor() : 1.0f, depth, proj };
+            ev::Emit(ev::Event::OnWorldRenderEnd, &a);
+            g_inBoundary = false;
+        }
     }
 
     /**
@@ -537,18 +863,75 @@ namespace
         VirtualProtect(&vtbl[idx], sizeof(void*), old, &old);
     }
 
-    // Installs the SetRenderTarget/SetDepthStencil filters on the live device's vtable. Each device instance
-    // has its own vtable, so on a gxRestart (new device) the swaps are gone; this re-applies them on the
-    // current device. Idempotent per device via g_filterDevice. The world-render minhook (address-based)
-    // survives the recreate and calls this each frame while supersampling is on.
-    void SsaaEnsureFilters(IDirect3DDevice9* dev)
+    /**
+     * @brief Detours IDirect3DDevice9::Reset (a resolution / window resize). D3D9 requires every
+     *        D3DPOOL_DEFAULT resource released before a Reset or it fails (D3DERR_INVALIDCALL) and the device is
+     *        lost -- the resize "crash". Disarm the supersampling redirect and free the offscreen world surfaces
+     *        (g_ssaaColor / g_worldDepth, both DEFAULT pool) plus any tracked engine render targets, fire
+     *        OnDeviceLost, run the native Reset, then fire OnDeviceReset on success so subscribers recreate. The
+     *        SSAA surfaces themselves recreate lazily on the next SsaaArmFrame, at the new backbuffer size.
+     * @param dev     the D3D9 device being reset.
+     * @param params  the present parameters the device resets with (new size / window mode).
+     * @return the native Reset result.
+     */
+    long __stdcall hkReset(void* dev, D3DPRESENT_PARAMETERS* params)
     {
-        if (!dev || g_filterDevice == dev) return;
+        static unsigned resetLog = 0;
+        const bool logThis = resetLog < 16;
+        if (logThis)
+        {
+            ++resetLog;
+            WLOG_INFO("render: Reset begin %ux%u windowed=%u",
+                      params ? params->BackBufferWidth : 0,
+                      params ? params->BackBufferHeight : 0,
+                      params ? static_cast<unsigned>(params->Windowed) : 0);
+        }
+
+        ev::DeviceResetArgs a{ dev, params };
+        g_colorRedirect = g_depthRedirect = false;
+        ReleaseTargets();             // free the offscreen SSAA color + world depth (DEFAULT pool)
+        gx::ReleaseResetResources();  // free any tracked engine render targets (DEFAULT pool)
+        ev::Emit(ev::Event::OnDeviceLost, &a);
+
+        const long r = g_origReset(dev, params);
+        if (SUCCEEDED(r))
+        {
+            ev::Emit(ev::Event::OnDeviceReset, &a);
+            if (logThis) WLOG_INFO("render: Reset ok");
+        }
+        else
+        {
+            static unsigned logged = 0;
+            if (logged < 8)
+            {
+                ++logged;
+                WLOG_WARN("render: Reset failed hr=0x%08lX", static_cast<unsigned long>(r));
+            }
+        }
+        return r;
+    }
+
+    // Installs all render vtable hooks on the live device. Each device instance may have its own vtable, so on
+    // a device recreate the swaps are gone; this re-applies them on the current device. The function-entry
+    // render hook survives the recreate and calls this each frame, so OnEndScene/OnFrame and the supersampling
+    // filters keep working after a restart. Guarded against the case where On12 hands several device instances
+    // one shared vtable: if it already carries our hooks, re-swapping would capture our own hook as the
+    // "original" and recurse, so only the device pointer is updated.
+    void EnsureDeviceHooks(IDirect3DDevice9* dev)
+    {
+        if (!dev || g_hookedDevice == dev) return;
         void** vtbl = *reinterpret_cast<void***>(dev);
-        SwapVtbl(vtbl, off::vt::kSetRenderTarget, reinterpret_cast<void*>(&hkSetRenderTarget), reinterpret_cast<void**>(&g_origSetRT));
-        SwapVtbl(vtbl, off::vt::kSetDepthStencil, reinterpret_cast<void*>(&hkSetDepthStencil), reinterpret_cast<void**>(&g_origSetDS));
-        g_filterDevice = dev;
-        WLOG_INFO("ssaa: SetRenderTarget/SetDepthStencil filters installed (dev=%p)", (void*)dev);
+        if (vtbl[off::vt::kPresent] != reinterpret_cast<void*>(&hkPresent))
+        {
+            SwapVtbl(vtbl, off::vt::kDrawIndexedPrimitive, reinterpret_cast<void*>(&hkDIP),             reinterpret_cast<void**>(&g_origDIP));
+            SwapVtbl(vtbl, off::vt::kEndScene,             reinterpret_cast<void*>(&hkEndScene),        reinterpret_cast<void**>(&g_origEndScene));
+            SwapVtbl(vtbl, off::vt::kPresent,              reinterpret_cast<void*>(&hkPresent),         reinterpret_cast<void**>(&g_origPresent));
+            SwapVtbl(vtbl, off::vt::kSetRenderTarget,      reinterpret_cast<void*>(&hkSetRenderTarget), reinterpret_cast<void**>(&g_origSetRT));
+            SwapVtbl(vtbl, off::vt::kSetDepthStencil,      reinterpret_cast<void*>(&hkSetDepthStencil), reinterpret_cast<void**>(&g_origSetDS));
+            SwapVtbl(vtbl, off::vt::kReset,                reinterpret_cast<void*>(&hkReset),           reinterpret_cast<void**>(&g_origReset));
+            WLOG_INFO("render: device hooks installed (dev=%p)", (void*)dev);
+        }
+        g_hookedDevice = dev;
     }
 }
 
@@ -561,16 +944,20 @@ namespace wxl::runtime::render
     {
         void* dev = gx::RawDevice();
         if (!dev) { WLOG_WARN("render: device not up, hooks skipped"); return; }
-        void** vtbl = *reinterpret_cast<void***>(dev);
 
-        SwapVtbl(vtbl, off::vt::kDrawIndexedPrimitive, reinterpret_cast<void*>(&hkDIP),
-                 reinterpret_cast<void**>(&g_origDIP));
-        SwapVtbl(vtbl, off::vt::kReset, reinterpret_cast<void*>(&hkReset),
-                 reinterpret_cast<void**>(&g_origReset));
-        SwapVtbl(vtbl, off::vt::kEndScene, reinterpret_cast<void*>(&hkEndScene),
-                 reinterpret_cast<void**>(&g_origEndScene));
-        SwapVtbl(vtbl, off::vt::kPresent, reinterpret_cast<void*>(&hkPresent),
-                 reinterpret_cast<void**>(&g_origPresent));
+        // Vtable hooks (DIP, EndScene, Present, SetRenderTarget, SetDepthStencil); re-applied on a device
+        // recreate from the surviving world-render function-entry hook (see EnsureDeviceHooks / hkWorldFinalize).
+        EnsureDeviceHooks(static_cast<IDirect3DDevice9*>(dev));
+
+        // Engine render-target bind + projection upload, a static vtable shared across device recreates,
+        // swapped once. The projection slot is observer-only: it snapshots the glue scene's projection for a
+        // depth-using effect (the glue camera is not in the world camera globals).
+        if (!g_origGxSetRT)
+        {
+            void** gxVtbl = reinterpret_cast<void**>(off::kGxDeviceVTable);
+            SwapVtbl(gxVtbl, off::kGxSetRenderTargetSlot, reinterpret_cast<void*>(&hkGxSetRT),         reinterpret_cast<void**>(&g_origGxSetRT));
+            SwapVtbl(gxVtbl, off::kGxSetProjectionSlot,   reinterpret_cast<void*>(&hkGxSetProjection), reinterpret_cast<void**>(&g_origGxSetProjection));
+        }
 
         // Function-entry detours; enabled by the batch EnableAll() the caller runs after all installers.
         wxl::core::hook::Install("M2DrawBatch", off::kDrawTriangleBatch,
@@ -579,6 +966,12 @@ namespace wxl::runtime::render
         wxl::core::hook::Install("WorldRenderFinalize", off::kWorldRenderFinalize,
                                  reinterpret_cast<void*>(&hkWorldFinalize),
                                  reinterpret_cast<void**>(&g_origWorldFinalize));
+        // Glue 3D-scene boundary (login / character-select model preview): the glue-side analogue of the world
+        // finalize hook. Fires OnWorldRenderEnd after the glue model renders, so the post-process AA reaches the
+        // glue screens without hooking the hot per-primitive CGxDevice::Draw path.
+        wxl::core::hook::Install("GlueModelRender", off::kSimpleModelFFXRender,
+                                 reinterpret_cast<void*>(&hkGlueModelRender),
+                                 reinterpret_cast<void**>(&g_origGlueModelRender));
         wxl::core::hook::Install("M2RibbonDraw", m2off::kRibbonDraw,
                                  reinterpret_cast<void*>(&hkRibbonDraw),
                                  reinterpret_cast<void**>(&g_origRibbonDraw));
@@ -586,6 +979,11 @@ namespace wxl::runtime::render
                                  reinterpret_cast<void*>(&hkLiquidRender),
                                  reinterpret_cast<void**>(&g_origLiquidRender));
 
-        WLOG_INFO("render: hooks installed (DIP, Reset, EndScene, Present, DrawBatch, WorldFinalize, RibbonDraw, LiquidRenderPass)");
+        WLOG_INFO("render: hooks installed (DIP, EndScene, Present, DrawBatch, WorldFinalize, GlueModelRender, RibbonDraw, LiquidRenderPass)");
+    }
+
+    void SetReadableDepthNeeded(bool needed)
+    {
+        g_depthNeeded = needed;
     }
 }

@@ -30,9 +30,11 @@ namespace wxl::events
         OnModelLoadPre,  // a model's raw bytes are read, before parse (ModelLoadArgs)
         OnModelLoad,     // a model finished loading and is parsed     (ModelLoadArgs)
         OnM2SkinFinalize,// a model's skin profile is being finalized  (M2SkinFinalizeArgs)
+        OnM2PerFrameUpdate, // per-render-ctx scene-graph update tick  (M2PerFrameUpdateArgs)
+        OnBuildBonePalette, // bone-palette fill for one instance, post-engine (BuildBonePaletteArgs)
         OnFrame,         // per-frame Present                          (FrameArgs)
         OnEndScene,      // end of the frame, before present           (EndSceneArgs)
-        OnDeviceLost,    // before IDirect3DDevice9::Reset releases resources (DeviceResetArgs)
+        OnDeviceLost,    // before IDirect3DDevice9::Reset frees DEFAULT resources (DeviceResetArgs)
         OnDeviceReset,   // after a successful IDirect3DDevice9::Reset  (DeviceResetArgs)
         OnUpdate,        // once-per-frame logic tick, with delta time (UpdateArgs)
         OnWorldRender,   // per-frame world draw pass                  (WorldRenderArgs)
@@ -53,6 +55,8 @@ namespace wxl::events
         OnTargetChanged, // the player's target was set via the API        (TargetChangedArgs)
         OnSoundPlay,     // a UI/world sound is about to play              (SoundPlayArgs)
         OnDoodadSpawn,   // a placed map doodad (CMapDoodad) was built (DoodadSpawnArgs)
+        OnItemSlotChange,// a character model slot received an item    (ItemSlotChangeArgs)
+        OnItemSlotClear, // a character model equipment slot was cleared(ItemSlotClearArgs)
         OnWorldEnter,    // the world/map finished loading, in-world   (WorldEnterArgs)
         OnWorldLeave,    // the world/map is being torn down           (WorldLeaveArgs)
         OnBeforeHostLaunch, // the DLL is about to launch the asset host (HostLaunchArgs)
@@ -75,7 +79,11 @@ namespace wxl::events
     struct UpdateArgs         { float dt; uint32_t timeMs; };
     /** @brief Args for OnEndScene. */
     struct EndSceneArgs       { void* device; };
-    /** @brief Args for OnDeviceLost and OnDeviceReset. */
+    /**
+     * @brief Args for OnDeviceLost (fired before the engine resets the D3D9 device -- e.g. a window resize --
+     *        while every D3DPOOL_DEFAULT resource must be released) and OnDeviceReset (fired after a successful
+     *        reset, so a subscriber recreates them). params is the D3DPRESENT_PARAMETERS* the reset (re)creates with.
+     */
     struct DeviceResetArgs    { void* device; void* params; };
     /** @brief Args for OnWorldRender. */
     struct WorldRenderArgs    { void* device; };
@@ -85,9 +93,12 @@ namespace wxl::events
      *        relative to the native backbuffer; a subscriber downsamples that surface into the native
      *        backbuffer. superSampleSource is null (and ssaaFactor 1.0) when supersampling is off. depthSource
      *        is the readable (INTZ) world depth surface (IDirect3DSurface9*) for depth-using effects, or null
-     *        when no readable depth was bound this frame.
+     *        when no readable depth was bound this frame. proj is an optional row-major float[16] projection
+     *        override (same layout as the in-world camera projection global) for depth-using effects: the world
+     *        boundary leaves it null (the subscriber reads the live world camera), while the glue boundary
+     *        passes the glue scene's projection, whose camera is not in the world camera globals.
      */
-    struct WorldRenderEndArgs { void* device; void* superSampleSource; float ssaaFactor; void* depthSource; };
+    struct WorldRenderEndArgs { void* device; void* superSampleSource; float ssaaFactor; void* depthSource; const float* proj; };
     /**
      * @brief Args for OnLiquidRender, fired before the native liquid pass draws. passType is 0 for the
      *        main pass, 1 for the secondary; instanceCount is the visible liquid instances in this pass;
@@ -178,6 +189,20 @@ namespace wxl::events
     struct SoundPlayArgs     { void* scriptState; };
     /** @brief Args for OnDoodadSpawn; read the transform via wxl::game::doodad. */
     struct DoodadSpawnArgs   { void* doodad; };
+    /** @brief Args for OnItemSlotChange; charModelObj is the CharModelObject, modelSlot is the internal
+     *         model slot index (maps to an equipment category), itemDataPtr points to the item data block. */
+    struct ItemSlotChangeArgs { void* charModelObj; uint32_t modelSlot; void* itemDataPtr; };
+    /** @brief Args for OnItemSlotClear; charModelObj is the CharModelObject, equipSlotWow is the
+     *         WoW equipment slot index (EQUIPMENT_SLOT_* constants, 0-18). */
+    struct ItemSlotClearArgs  { void* charModelObj; uint32_t equipSlotWow; };
+    /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the
+     *         scene graph is updating — fires once per visible M2 instance per frame. */
+    struct M2PerFrameUpdateArgs { void* renderCtx; };
+    /** @brief Args for OnBuildBonePalette; fires after the engine fills the per-instance bone palette
+     *         from the current animation pose, immediately before the batch draw uploads it to the
+     *         vertex shader. renderCtx is the M2Instance whose bone palette was just written.
+     *         Subscribers may overwrite bone matrices here to override the engine's pose. */
+    struct BuildBonePaletteArgs { void* renderCtx; };
     /** @brief Args for OnWorldEnter. */
     struct WorldEnterArgs    { uint32_t mapId; };
     /** @brief Args for OnWorldLeave. */

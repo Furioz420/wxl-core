@@ -21,9 +21,16 @@ namespace wxl::runtime::render
     /**
      * @brief Installs the render-pipeline detours that republish render events.
      *
-     * Emits OnM2BatchDraw, OnEndScene, OnFrame, OnDeviceLost, OnDeviceReset and OnWorldRenderEnd.
-     * Call once after the graphics device is up; the function detours are armed by the caller's
-     * EnableAll() afterwards.
+     * Emits OnM2BatchDraw, OnEndScene, OnFrame, OnDeviceLost, OnDeviceReset and OnWorldRenderEnd. Call once
+     * after the graphics device is up; the function detours are armed by the caller's EnableAll() afterwards.
      */
     void Install();
+
+    /**
+     * @brief Declares whether a depth-using post-process effect (e.g. SSAO) is active this frame, so the
+     *        readable INTZ world depth is produced even when supersampling is off. Set by the graphics
+     *        module each frame from its enabled effects.
+     * @param needed  true when an enabled effect samples the world depth.
+     */
+    void SetReadableDepthNeeded(bool needed);
 }
