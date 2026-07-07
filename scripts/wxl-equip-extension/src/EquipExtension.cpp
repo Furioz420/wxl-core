@@ -74,6 +74,22 @@ namespace wxl::scripts::equipextension
         GeosetFilter geoFilter = {};
     };
 
+    struct SidecarMaterialEntry
+    {
+        uint32_t modelIndex  = static_cast<uint32_t>(-1);
+        uint32_t modelColumn = static_cast<uint32_t>(-1);
+        uint32_t layer       = static_cast<uint32_t>(-1);
+        uint32_t textureType = static_cast<uint32_t>(-1);
+        char     folder[32]  = {};
+        char     model[264]  = {};
+        char     texture[264] = {};
+        char     skinSectionIds[256] = {};
+        char     batchIndexes[256] = {};
+        char     targetSkinSectionIds[256] = {};
+        char     targetBatchIndexes[256] = {};
+        char     targetMode[32] = {};
+    };
+
     // One attachment entry per attached M2. Keyed by CharModelObject pointer in g_attached.
     struct AttachEntry
     {
@@ -84,6 +100,7 @@ namespace wxl::scripts::equipextension
         char        keyBuf[264] = {};        // real M2 path (used for matching/dedup)
         char        mangledKeyBuf[264] = {}; // virtual _wxl_ path for GetRenderCtx (collection only)
         char        texBuf[264] = {};    // BLP path for BindTexSlot on re-attach
+        char        matTexBuf[2048] = {}; // batch-scoped material texture patches for virtual M2 bytes
         GeosetFilter geoFilter  = {};
         BoneRemap    boneRemap  = {};
         uint32_t    mergeKey = 0; // non-zero keeps logical semicolon collection models separate
@@ -99,6 +116,7 @@ namespace wxl::scripts::equipextension
 
     static bool g_sidecarLoaded = false;
     static std::unordered_map<uint32_t, std::vector<SidecarModelEntry>> g_sidecarModels;
+    static std::unordered_map<uint32_t, std::vector<SidecarMaterialEntry>> g_sidecarMaterials;
 
     // Set to the cmo being processed in RebuildAllModels Phase1. OnM2SkinFinalize uses
     // this to apply the filter during a synchronous load that fires kFinalizeSkin inside
@@ -175,10 +193,14 @@ namespace wxl::scripts::equipextension
 
     static bool SameAttachModelGroup(const AttachEntry& a, const AttachEntry& b) noexcept
     {
+        const bool aFiltered = a.geoFilter.count > 0;
+        const bool bFiltered = b.geoFilter.count > 0;
         return a.mergeKey == b.mergeKey &&
                a.attachId == b.attachId &&
+               aFiltered == bFiltered &&
                std::strcmp(a.keyBuf, b.keyBuf) == 0 &&
-               std::strcmp(a.texBuf, b.texBuf) == 0;
+               std::strcmp(a.texBuf, b.texBuf) == 0 &&
+               std::strcmp(a.matTexBuf, b.matTexBuf) == 0;
     }
 
     // ─── SEH helpers (no C++ objects — safe to use __try/__except) ───────────────
@@ -498,6 +520,63 @@ namespace wxl::scripts::equipextension
     }
 
     static bool StartsWithCI(const char* s, const char* prefix) noexcept;
+    static bool ContainsCI(const char* s, const char* needle) noexcept;
+
+    static uint32_t ParseModelColumn(const char* value) noexcept
+    {
+        if (!value || !*value) return static_cast<uint32_t>(-1);
+        uint32_t numeric = 0;
+        if (ParseU32(value, &numeric))
+        {
+            if (numeric == 0 || numeric == 1) return numeric;
+            if (numeric == 2) return 1;
+            return static_cast<uint32_t>(-1);
+        }
+
+        if (ContainsCI(value, "ModelName_1") || ContainsCI(value, "ModelTexture_1") ||
+            ContainsCI(value, "Model_1") || ContainsCI(value, "Texture_1"))
+            return 0;
+        if (ContainsCI(value, "ModelName_2") || ContainsCI(value, "ModelTexture_2") ||
+            ContainsCI(value, "Model_2") || ContainsCI(value, "Texture_2"))
+            return 1;
+        return static_cast<uint32_t>(-1);
+    }
+
+    static void NormalizedStemKey(const char* value, char* out, size_t outSz) noexcept
+    {
+        if (!out || outSz == 0) return;
+        out[0] = '\0';
+        if (!value) return;
+
+        const char* base = value;
+        for (const char* p = value; *p; ++p)
+            if (*p == '\\' || *p == '/') base = p + 1;
+
+        const char* end = base + std::strlen(base);
+        for (const char* p = base; *p; ++p)
+        {
+            if (*p == ':' || *p == '.') { end = p; break; }
+        }
+
+        size_t n = 0;
+        for (const char* p = base; p < end && n + 1 < outSz; ++p)
+        {
+            char c = *p;
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')
+                out[n++] = c;
+        }
+        out[n] = '\0';
+    }
+
+    static bool ModelStemMatches(const char* sidecarModel, const char* model) noexcept
+    {
+        if (!sidecarModel || !*sidecarModel) return true;
+        char a[264], b[264];
+        NormalizedStemKey(sidecarModel, a, sizeof(a));
+        NormalizedStemKey(model, b, sizeof(b));
+        return a[0] && b[0] && std::strcmp(a, b) == 0;
+    }
 
     static uint32_t ParseSidecarSlot(const char* slot) noexcept
     {
@@ -737,7 +816,8 @@ namespace wxl::scripts::equipextension
 
     static bool NeedsVirtualModel(const AttachEntry& e) noexcept
     {
-        return e.geoFilter.count > 0 ||
+        return e.matTexBuf[0] ||
+               e.geoFilter.count > 0 ||
                (e.texBuf[0] && IsCollectionObjectPath(e.keyBuf));
     }
 
@@ -829,6 +909,75 @@ namespace wxl::scripts::equipextension
             EquipLog("sidecar loaded '%s' rows=%u", path, loaded);
     }
 
+    static void LoadMaterialSidecarFile(const char* path)
+    {
+        FILE* f = std::fopen(path, "rb");
+        if (!f) return;
+
+        char line[4096];
+        if (!std::fgets(line, sizeof(line), f))
+        {
+            std::fclose(f);
+            return;
+        }
+
+        const std::vector<std::string> header = ParseCsvLine(line);
+        const int cDisplay = FindCsvColumn(header, "DisplayID");
+        const int cModelIndex = FindCsvColumn(header, "ModelIndex");
+        const int cModelColumn = FindCsvColumn(header, "ModelColumn");
+        const int cModel = FindCsvColumn(header, "Model");
+        const int cLayer = FindCsvColumn(header, "Layer");
+        const int cTextureType = FindCsvColumn(header, "TextureType");
+        const int cFolder = FindCsvColumn(header, "Folder");
+        const int cTexture = FindCsvColumn(header, "Texture");
+        const int cSkinSectionIds = FindCsvColumn(header, "SkinSectionIDs");
+        const int cBatchIndexes = FindCsvColumn(header, "BatchIndexes");
+        const int cTargetSkinSectionIds = FindCsvColumn(header, "TargetSkinSectionIDs");
+        const int cTargetBatchIndexes = FindCsvColumn(header, "TargetBatchIndexes");
+        const int cTargetMode = FindCsvColumn(header, "TargetMode");
+
+        if (cDisplay < 0 || cLayer < 0 || cTexture < 0)
+        {
+            EquipLog("material sidecar '%s': missing DisplayID, Layer, or Texture column", path);
+            std::fclose(f);
+            return;
+        }
+
+        uint32_t loaded = 0;
+        while (std::fgets(line, sizeof(line), f))
+        {
+            const std::vector<std::string> row = ParseCsvLine(line);
+            uint32_t displayId = 0;
+            if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
+
+            SidecarMaterialEntry e = {};
+            ParseU32(CsvField(row, cModelIndex), &e.modelIndex);
+            e.modelColumn = ParseModelColumn(CsvField(row, cModelColumn));
+            if (e.modelColumn == static_cast<uint32_t>(-1))
+                e.modelColumn = ParseModelColumn(CsvField(row, cModelIndex));
+            if (!ParseU32(CsvField(row, cLayer), &e.layer) || e.layer > 15) continue;
+            if (cTextureType >= 0)
+                ParseU32(CsvField(row, cTextureType), &e.textureType);
+
+            CopyString(e.folder, sizeof(e.folder), CsvField(row, cFolder));
+            CopyString(e.model, sizeof(e.model), CsvField(row, cModel));
+            CopyString(e.texture, sizeof(e.texture), CsvField(row, cTexture));
+            CopyString(e.skinSectionIds, sizeof(e.skinSectionIds), CsvField(row, cSkinSectionIds));
+            CopyString(e.batchIndexes, sizeof(e.batchIndexes), CsvField(row, cBatchIndexes));
+            CopyString(e.targetSkinSectionIds, sizeof(e.targetSkinSectionIds), CsvField(row, cTargetSkinSectionIds));
+            CopyString(e.targetBatchIndexes, sizeof(e.targetBatchIndexes), CsvField(row, cTargetBatchIndexes));
+            CopyString(e.targetMode, sizeof(e.targetMode), CsvField(row, cTargetMode));
+            if (!e.texture[0]) continue;
+
+            g_sidecarMaterials[displayId].push_back(e);
+            ++loaded;
+        }
+
+        std::fclose(f);
+        if (loaded)
+            EquipLog("material sidecar loaded '%s' rows=%u", path, loaded);
+    }
+
     static void LoadSidecarModels()
     {
         if (g_sidecarLoaded) return;
@@ -836,6 +985,8 @@ namespace wxl::scripts::equipextension
 
         LoadSidecarFile("WXLItemDisplayModels.csv");
         LoadSidecarFile("DBFilesClient\\WXLItemDisplayModels.csv");
+        LoadMaterialSidecarFile("WXLItemDisplayModelMaterials.csv");
+        LoadMaterialSidecarFile("DBFilesClient\\WXLItemDisplayModelMaterials.csv");
 
         WIN32_FIND_DATAA fd = {};
         HANDLE h = FindFirstFileA("Data\\*.MPQ", &fd);
@@ -848,12 +999,17 @@ namespace wxl::scripts::equipextension
                 path += fd.cFileName;
                 path += "\\DBFilesClient\\WXLItemDisplayModels.csv";
                 LoadSidecarFile(path.c_str());
+                path = "Data\\";
+                path += fd.cFileName;
+                path += "\\DBFilesClient\\WXLItemDisplayModelMaterials.csv";
+                LoadMaterialSidecarFile(path.c_str());
             }
             while (FindNextFileA(h, &fd));
             FindClose(h);
         }
 
-        EquipLog("sidecar table ready: displays=%zu", g_sidecarModels.size());
+        EquipLog("sidecar table ready: displays=%zu materialDisplays=%zu",
+                 g_sidecarModels.size(), g_sidecarMaterials.size());
     }
 
     // ─── Path builders ────────────────────────────────────────────────────────────
@@ -961,6 +1117,160 @@ namespace wxl::scripts::equipextension
         buf[bufSz - 1] = '\0';
     }
 
+    static bool MaterialEntryMatches(const SidecarMaterialEntry& e,
+                                     uint32_t modelColumn,
+                                     uint32_t partIndex,
+                                     const char* modelName) noexcept
+    {
+        const bool hasModelName = e.model[0] != '\0';
+        if (hasModelName && !ModelStemMatches(e.model, modelName)) return false;
+        if (!hasModelName &&
+            e.modelColumn != static_cast<uint32_t>(-1) &&
+            e.modelColumn != modelColumn)
+            return false;
+        if (hasModelName &&
+            modelColumn != static_cast<uint32_t>(-1) &&
+            e.modelColumn != static_cast<uint32_t>(-1) &&
+            e.modelColumn != modelColumn)
+            return false;
+
+        if (!hasModelName && e.modelColumn == static_cast<uint32_t>(-1) &&
+            e.modelIndex != static_cast<uint32_t>(-1))
+        {
+            const bool columnKnown = modelColumn != static_cast<uint32_t>(-1);
+            const bool columnMatch = columnKnown &&
+                (e.modelIndex == modelColumn || e.modelIndex == modelColumn + 1);
+            const bool partMatch = e.modelIndex == partIndex || e.modelIndex == partIndex + 1;
+            if (!columnMatch && !partMatch)
+                return false;
+        }
+
+        return e.layer != static_cast<uint32_t>(-1) && e.texture[0];
+    }
+
+    static const char* FirstNonEmpty(const char* a, const char* b) noexcept
+    {
+        return (a && *a) ? a : ((b && *b) ? b : "");
+    }
+
+    static bool IsNormalHeadShoulderEdgeFadeMaterial(bool isCollection,
+                                                     const char* slotFolder,
+                                                     const char* modelName,
+                                                     const SidecarMaterialEntry& m) noexcept
+    {
+        if (isCollection || m.textureType != 3) return false;
+        return ContainsCI(slotFolder, "Head") ||
+               ContainsCI(slotFolder, "Shoulder") ||
+               ContainsCI(modelName, "helm_") ||
+               ContainsCI(modelName, "shoulder_");
+    }
+
+    static bool HasTargetedMaterialRows(uint32_t displayId,
+                                        uint32_t modelColumn,
+                                        uint32_t partIndex,
+                                        const char* modelName,
+                                        const char* slotFolder,
+                                        bool isCollection) noexcept
+    {
+        auto it = g_sidecarMaterials.find(displayId);
+        if (it == g_sidecarMaterials.end()) return false;
+        for (const SidecarMaterialEntry& m : it->second)
+        {
+            if (!MaterialEntryMatches(m, modelColumn, partIndex, modelName)) continue;
+            const bool edgeFadeHide =
+                IsNormalHeadShoulderEdgeFadeMaterial(isCollection, slotFolder, modelName, m);
+            const bool hideMode = edgeFadeHide ||
+                                  ContainsCI(m.targetMode, "Hide") ||
+                                  StartsWithCI(m.texture, "__hide__") ||
+                                  StartsWithCI(m.texture, "hide");
+            const bool slotTargetMode = ContainsCI(m.targetMode, "SlotGeosets");
+            const bool hasTargets =
+                m.targetBatchIndexes[0] || m.targetSkinSectionIds[0] ||
+                (slotTargetMode && (m.batchIndexes[0] || m.skinSectionIds[0]));
+            if (!hasTargets && !edgeFadeHide) continue;
+            if (!isCollection && !hideMode && m.layer == 0 && m.textureType == 2) continue;
+            return true;
+        }
+        return false;
+    }
+
+    static void BuildMaterialPatchSpec(char* out, size_t outSz,
+                                       uint32_t displayId,
+                                       uint32_t modelColumn,
+                                       uint32_t partIndex,
+                                       const char* modelName,
+                                       const char* raceCode,
+                                       const char* genderStr,
+                                       const char* slotFolder,
+                                       bool isCollection,
+                                       const char* customFolder,
+                                       const char* modelStem)
+    {
+        if (!out || outSz == 0) return;
+        out[0] = '\0';
+
+        auto it = g_sidecarMaterials.find(displayId);
+        if (it == g_sidecarMaterials.end()) return;
+        if (!HasTargetedMaterialRows(displayId, modelColumn, partIndex, modelName,
+                                     slotFolder, isCollection)) return;
+
+        size_t used = 0;
+        for (const SidecarMaterialEntry& m : it->second)
+        {
+            if (!MaterialEntryMatches(m, modelColumn, partIndex, modelName)) continue;
+            const bool edgeFadeHide =
+                IsNormalHeadShoulderEdgeFadeMaterial(isCollection, slotFolder, modelName, m);
+            const bool hideMode = edgeFadeHide ||
+                                  ContainsCI(m.targetMode, "Hide") ||
+                                  StartsWithCI(m.texture, "__hide__") ||
+                                  StartsWithCI(m.texture, "hide");
+            if (!isCollection && !hideMode && m.layer == 0 && m.textureType == 2) continue;
+
+            const bool slotTargetMode = ContainsCI(m.targetMode, "SlotGeosets");
+            const bool collectionSkinMapTargets =
+                isCollection && m.batchIndexes[0] && !edgeFadeHide;
+            const char* targetBatches = collectionSkinMapTargets
+                ? m.batchIndexes
+                : FirstNonEmpty(m.targetBatchIndexes, slotTargetMode ? m.batchIndexes : "");
+            const char* targetSections = collectionSkinMapTargets
+                ? ""
+                : FirstNonEmpty(m.targetSkinSectionIds, slotTargetMode ? m.skinSectionIds : "");
+            if (!targetBatches[0] && !targetSections[0] && !edgeFadeHide) continue;
+
+            char texPath[264] = {};
+            if (edgeFadeHide)
+            {
+                std::strncpy(texPath, "__hide__edgefade", sizeof(texPath) - 1);
+                texPath[sizeof(texPath) - 1] = '\0';
+            }
+            else if (hideMode)
+            {
+                std::strncpy(texPath, "__hide__", sizeof(texPath) - 1);
+                texPath[sizeof(texPath) - 1] = '\0';
+            }
+            else
+            {
+                const char* folder = m.folder[0] ? m.folder : customFolder;
+                BuildTexPath(texPath, sizeof(texPath), m.texture, raceCode, genderStr, 0,
+                             slotFolder, isCollection, folder, modelStem);
+            }
+            if (!texPath[0]) continue;
+
+            char item[768];
+            const uint32_t textureType =
+                m.textureType == static_cast<uint32_t>(-1) ? 0xffffffffu : m.textureType;
+            int n = std::snprintf(item, sizeof(item), "%s%u:%u:%s:%s=%s",
+                                  used ? "|" : "", m.layer, textureType,
+                                  targetBatches, targetSections, texPath);
+            if (n <= 0) continue;
+            const size_t len = static_cast<size_t>(n);
+            if (len >= sizeof(item) || used + len >= outSz) break;
+            std::memcpy(out + used, item, len);
+            used += len;
+            out[used] = '\0';
+        }
+    }
+
     // ─── Geoset filter ────────────────────────────────────────────────────────────
 
     // Zeros rawTri (skin->indices) for submeshes whose skinSectionId is not in the filter.
@@ -986,11 +1296,9 @@ namespace wxl::scripts::equipextension
                 uint16_t lvl   = skin->submeshes[si].level;
                 uint16_t start16 = skin->submeshes[si].indexStart;
                 uint16_t count16 = skin->submeshes[si].indexCount;
-                // skinSectionId=0 is the base/untagged mesh; always keep it.
-                bool visible = (secId == 0);
-                if (!visible)
-                    for (uint32_t fi = 0; fi < filter.count; ++fi)
-                        if (filter.ids[fi] == secId) { visible = true; break; }
+                bool visible = false;
+                for (uint32_t fi = 0; fi < filter.count; ++fi)
+                    if (filter.ids[fi] == secId) { visible = true; break; }
                 EquipLog("    submesh[%u]: skinSectionId=%u level=%u indexStart=%u indexCount=%u -> %s",
                          si, (uint32_t)secId, (uint32_t)lvl, (uint32_t)start16, (uint32_t)count16,
                          visible ? "KEEP" : "ZERO");
@@ -1115,11 +1423,13 @@ namespace wxl::scripts::equipextension
             // Build the virtual key and ensure bytes are in the serve table.
             char mangled[264];
             const size_t mangledLen =
-                VPathBuildKey(mangled, sizeof(mangled), cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf, e.mergeKey);
+                VPathBuildKey(mangled, sizeof(mangled), cmo, e.keyBuf, mergedIds, mergedCount,
+                              e.texBuf, e.mergeKey, e.matTexBuf);
             const bool vpathReady = mangledLen != 0 &&
-                VPathPopulate(cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf, e.mergeKey);
-            EquipLog("  VPath: '%s' tex='%s' -> '%s' (merged=%u mergeKey=0x%X)",
-                     e.keyBuf, e.texBuf, vpathReady ? mangled : "(disabled)", mergedCount, e.mergeKey);
+                VPathPopulate(cmo, e.keyBuf, mergedIds, mergedCount, e.texBuf, e.mergeKey, e.matTexBuf);
+            EquipLog("  VPath: '%s' tex='%s' mat='%s' -> '%s' (merged=%u mergeKey=0x%X)",
+                     e.keyBuf, e.texBuf, e.matTexBuf, vpathReady ? mangled : "(disabled)",
+                     mergedCount, e.mergeKey);
             if (!vpathReady)
                 continue;
 
@@ -1528,8 +1838,15 @@ namespace wxl::scripts::equipextension
                     BuildTexPath(texPath, sizeof(texPath), texPart, raceCode, genderStr,
                                  ef, cfg.folder, isCollection, customFolder, stem);
 
-                EquipLog("  %s[%u]: attach=%u path='%s' tex='%s' geoCount=%u",
-                         label, idx, attach, modelPath, texPath[0] ? texPath : "(none)", geo.count);
+                char matTexSpec[2048] = {};
+                const uint32_t modelColumn = (label && label[1] == '1') ? 0u : 1u;
+                BuildMaterialPatchSpec(matTexSpec, sizeof(matTexSpec), displayId,
+                                       modelColumn, idx, stem, raceCode, genderStr,
+                                       cfg.folder, isCollection, customFolder, stem);
+
+                EquipLog("  %s[%u]: attach=%u path='%s' tex='%s' mat='%s' geoCount=%u",
+                         label, idx, attach, modelPath, texPath[0] ? texPath : "(none)",
+                         matTexSpec, geo.count);
 
                 AttachEntry e = {};
                 e.equipSlot = a.modelSlot;
@@ -1537,6 +1854,7 @@ namespace wxl::scripts::equipextension
                 e.subObj    = subObj;
                 std::memcpy(e.keyBuf, modelPath, sizeof(e.keyBuf));
                 std::memcpy(e.texBuf, texPath,   sizeof(e.texBuf));
+                std::memcpy(e.matTexBuf, matTexSpec, sizeof(e.matTexBuf));
                 e.geoFilter = geo;
                 if (isCollection && mixedCollectionRow)
                     e.mergeKey = ((a.modelSlot + 1) << 16) |
@@ -1595,9 +1913,15 @@ namespace wxl::scripts::equipextension
                                  textureFlags, cfg.folder, isCollectionPath,
                                  sc.folder[0] ? sc.folder : nullptr, sc.model);
 
-                EquipLog("  SC[%u]: attach=%u path='%s' tex='%s' geoCount=%u slot=%u",
+                char matTexSpec[2048] = {};
+                BuildMaterialPatchSpec(matTexSpec, sizeof(matTexSpec), displayId,
+                                       static_cast<uint32_t>(-1), sidecarIndex, sc.model,
+                                       raceCode, genderStr, cfg.folder, isCollectionPath,
+                                       sc.folder[0] ? sc.folder : nullptr, sc.model);
+
+                EquipLog("  SC[%u]: attach=%u path='%s' tex='%s' mat='%s' geoCount=%u slot=%u",
                          sidecarIndex, attach, modelPath, texPath[0] ? texPath : "(none)",
-                         sc.geoFilter.count, sc.modelSlot);
+                         matTexSpec, sc.geoFilter.count, sc.modelSlot);
 
                 AttachEntry e = {};
                 e.equipSlot = a.modelSlot;
@@ -1605,6 +1929,7 @@ namespace wxl::scripts::equipextension
                 e.subObj    = subObj;
                 std::memcpy(e.keyBuf, modelPath, sizeof(e.keyBuf));
                 std::memcpy(e.texBuf, texPath,   sizeof(e.texBuf));
+                std::memcpy(e.matTexBuf, matTexSpec, sizeof(e.matTexBuf));
                 e.geoFilter = sc.geoFilter;
                 g_attached[cmo].push_back(e);
                 added = true;
