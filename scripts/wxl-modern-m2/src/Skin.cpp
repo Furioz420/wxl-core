@@ -176,85 +176,6 @@ namespace wxl::scripts::modernm2::skin
         }
 
         /**
-         * @brief Parks sibling retail character geoset variants when no modern customization mapping exists.
-         *
-         * Retail character skins carry many mutually-exclusive variants in each hundred-group
-         * (501/502/503..., 3501/3502/...). The 3.3.5 character customization path does not know these retail
-         * section IDs, so every sibling can render at once. Until the DB2 customization tables are mapped into
-         * the old CharSections-style selection, keep group 0 body chunks and the first variant of every other
-         * group as a conservative diagnostic fallback.
-         */
-        uint32_t ParkCharacterVariantGeosets(Skin* skin, std::vector<uint8_t>& badSubmesh, const char* name)
-        {
-            if (!skin || !StartsWithCI(name, "character\\")) return 0;
-
-            constexpr uint32_t kMaxGroup = 0xFFFFu / 100u;
-            constexpr uint16_t kKeepFirst = 0xFFFFu;
-            constexpr uint16_t kKeepNone  = 0xFFFEu;
-
-            std::vector<uint16_t> keep(kMaxGroup + 1, kKeepFirst);
-            bool filterLowGroup = false;
-            uint16_t keepLowA = 0;
-            uint16_t keepLowB = kKeepFirst;
-            if (StartsWithCI(name, "character\\human\\male\\"))
-            {
-                filterLowGroup = true;
-                keepLowA = 0;       // body/base section; default bald has no extra low-ID hair section
-                keep[1] = kKeepNone; // beard: default None
-                keep[2] = kKeepNone; // sideburns: default None
-                keep[3] = kKeepNone; // mustache: default None
-                keep[7] = 702;       // ears: Round
-                keep[32] = 3202;     // face shape: Narrow
-                keep[34] = kKeepNone; // eyebrows: default maps to geoset 3400, not present in the skin
-            }
-            else if (StartsWithCI(name, "character\\human\\female\\"))
-            {
-                filterLowGroup = true;
-                keepLowA = 0;       // body/base section
-                keepLowB = 2;       // default hair style: Straight
-                keep[7] = 702;       // ears: Round
-                keep[32] = 3202;     // face shape: Narrow
-                keep[35] = kKeepNone; // piercings: default None
-                keep[36] = kKeepNone; // necklace: default None
-            }
-
-            for (uint32_t i = 0; i < skin->submeshCount; ++i)
-            {
-                const auto& s = skin->submeshes[i];
-                const uint16_t id = s.skinSectionId;
-                if (id < 100 || s.indexCount == 0) continue;
-                const uint32_t group = id / 100u;
-                if (group >= keep.size()) continue;
-                if (keep[group] != kKeepFirst) continue;
-                if (id < keep[group]) keep[group] = id;
-            }
-
-            uint32_t parked = 0;
-            for (uint32_t i = 0; i < skin->submeshCount; ++i)
-            {
-                auto* s = &skin->submeshes[i];
-                const uint16_t id = s->skinSectionId;
-                if (s->indexCount == 0) continue;
-                if (id < 100)
-                {
-                    if (!filterLowGroup || id == keepLowA || id == keepLowB) continue;
-                }
-                else
-                {
-                    const uint32_t group = id / 100u;
-                    if (group < keep.size() && keep[group] != kKeepNone && keep[group] == id) continue;
-                }
-
-                s->level = 0; s->vertexStart = 0; s->vertexCount = 0; s->indexStart = 0;
-                s->indexCount = 0; s->boneComboIndex = 0; s->centerBoneIndex = 0;
-                if (s->boneCount < 1) s->boneCount = 1;
-                if (i < badSubmesh.size()) badSubmesh[i] = 1;
-                ++parked;
-            }
-            return parked;
-        }
-
-        /**
          * @brief Decodes a < kSourceShaderMin shaderId's blend bits and synthesizes its texUnitLookup entries,
          *        in place.
          * @param b             Batch holding the decoded shaderId, updated in place.
@@ -550,9 +471,6 @@ namespace wxl::scripts::modernm2::skin
             WLOG_INFO("modern-m2: '%s' bone-splitter rebuilt skin geometry (extra sub-draws=%u)", name, splitCount);
 
         FixSubmeshes(md, skin, badSubmesh, extendedIndexStart);
-        const uint32_t parkedVariants = ParkCharacterVariantGeosets(skin, badSubmesh, name);
-        if (parkedVariants)
-            WLOG_INFO("modern-m2: '%s' parked %u fallback character geoset variant(s)", name, parkedVariants);
         FixTexUnits(skin, badSubmesh, splitMap, batches, texUnitLookup, blendOverride,
                     nTransparencyLookup, nTransformLookup);
 
