@@ -478,7 +478,7 @@ namespace wxl::scripts::equipextension
             if (batchOfs + sizeof(wxl::structure::m2::M2Batch) > skinBytes.size()) return false;
             const uint8_t flags = skinBytes[batchOfs + 0x00];
             const uint16_t shaderId = ReadU16(skinBytes, batchOfs + 0x02);
-            return flags == 0x88 && (shaderId == 0x4011 || shaderId == 0x8015);
+            return (flags & 0x80) != 0 && (shaderId == 0x4011 || shaderId == 0x8015);
         }
 
         static uint32_t RemoveHiddenBatches(std::vector<uint8_t>& skinBytes,

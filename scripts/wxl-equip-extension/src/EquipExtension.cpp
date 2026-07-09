@@ -18,7 +18,9 @@
 #include "VirtualPath.hpp"
 #include "events/Event.hpp"
 #include "game/Binding.hpp"
+#include "game/io/Io.hpp"
 #include "game/m2/M2.hpp"
+#include "offsets/engine/Io.hpp"
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/M2.hpp"
 
@@ -814,11 +816,28 @@ namespace wxl::scripts::equipextension
                ContainsCI(path, "objectcomponents/collections/");
     }
 
+    static bool IsCollectionGloveBodyModel(uint32_t modelSlot, const char* stem) noexcept
+    {
+        return modelSlot == 8 && stem && ContainsCI(stem, "_glove");
+    }
+
     static bool NeedsVirtualModel(const AttachEntry& e) noexcept
     {
         return e.matTexBuf[0] ||
                e.geoFilter.count > 0 ||
                (e.texBuf[0] && IsCollectionObjectPath(e.keyBuf));
+    }
+
+    static bool IsCollectionEntry(const AttachEntry& e) noexcept
+    {
+        return e.geoFilter.count > 0 || IsCollectionObjectPath(e.keyBuf);
+    }
+
+    static bool ShouldDetachDefaultAttachPoints(const AttachEntry& e) noexcept
+    {
+        if (e.equipSlot >= 11) return false;
+        if (e.equipSlot == 8 && e.attachId == kCollectionAttach) return false;
+        return true;
     }
 
     static void AnalyzeModelList(const char* list, bool* hasCollection, bool* hasNormal)
@@ -833,19 +852,59 @@ namespace wxl::scripts::equipextension
         }
     }
 
-    static void LoadSidecarFile(const char* path)
+    static bool ReadSidecarLines(const char* path, std::vector<std::string>& lines)
     {
-        FILE* f = std::fopen(path, "rb");
-        if (!f) return;
+        lines.clear();
+        if (!path || !*path) return false;
 
-        char line[4096];
-        if (!std::fgets(line, sizeof(line), f))
+        if (FILE* f = std::fopen(path, "rb"))
         {
+            char line[4096];
+            while (std::fgets(line, sizeof(line), f))
+                lines.emplace_back(line);
             std::fclose(f);
-            return;
+            return !lines.empty();
         }
 
-        const std::vector<std::string> header = ParseCsvLine(line);
+        namespace io    = wxl::game::io;
+        namespace iooff = wxl::offsets::engine::io;
+
+        void* handle = nullptr;
+        if (!io::FileOpen(path, iooff::kOpenWholeFile, &handle) || !handle)
+            return false;
+
+        uint32_t sizeHigh = 0;
+        const uint32_t size = io::FileSize(handle, &sizeHigh);
+        std::string bytes;
+        bool ok = false;
+        if (size > 0 && sizeHigh == 0)
+        {
+            bytes.resize(size);
+            uint32_t got = 0;
+            io::FileRead(handle, &bytes[0], size, &got);
+            ok = (got == size);
+        }
+        io::FileClose(handle);
+        if (!ok) return false;
+
+        size_t start = 0;
+        for (size_t i = 0; i <= bytes.size(); ++i)
+        {
+            if (i != bytes.size() && bytes[i] != '\n') continue;
+            std::string line = bytes.substr(start, i - start);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            lines.push_back(line);
+            start = i + 1;
+        }
+        return !lines.empty();
+    }
+
+    static void LoadSidecarFile(const char* path)
+    {
+        std::vector<std::string> lines;
+        if (!ReadSidecarLines(path, lines)) return;
+
+        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
         const int cDisplay = FindCsvColumn(header, "DisplayID");
         const int cSlot = FindCsvColumn(header, "Slot");
         int cModel = FindCsvColumn(header, "Model");
@@ -864,14 +923,14 @@ namespace wxl::scripts::equipextension
         if (cDisplay < 0 || cModel < 0)
         {
             EquipLog("sidecar '%s': missing DisplayID or Model column", path);
-            std::fclose(f);
             return;
         }
 
         uint32_t loaded = 0;
-        while (std::fgets(line, sizeof(line), f))
+        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
         {
-            const std::vector<std::string> row = ParseCsvLine(line);
+            if (lines[lineIndex].empty()) continue;
+            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
             uint32_t displayId = 0;
             if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
 
@@ -904,24 +963,16 @@ namespace wxl::scripts::equipextension
             ++loaded;
         }
 
-        std::fclose(f);
         if (loaded)
             EquipLog("sidecar loaded '%s' rows=%u", path, loaded);
     }
 
     static void LoadMaterialSidecarFile(const char* path)
     {
-        FILE* f = std::fopen(path, "rb");
-        if (!f) return;
+        std::vector<std::string> lines;
+        if (!ReadSidecarLines(path, lines)) return;
 
-        char line[4096];
-        if (!std::fgets(line, sizeof(line), f))
-        {
-            std::fclose(f);
-            return;
-        }
-
-        const std::vector<std::string> header = ParseCsvLine(line);
+        const std::vector<std::string> header = ParseCsvLine(lines[0].c_str());
         const int cDisplay = FindCsvColumn(header, "DisplayID");
         const int cModelIndex = FindCsvColumn(header, "ModelIndex");
         const int cModelColumn = FindCsvColumn(header, "ModelColumn");
@@ -939,14 +990,14 @@ namespace wxl::scripts::equipextension
         if (cDisplay < 0 || cLayer < 0 || cTexture < 0)
         {
             EquipLog("material sidecar '%s': missing DisplayID, Layer, or Texture column", path);
-            std::fclose(f);
             return;
         }
 
         uint32_t loaded = 0;
-        while (std::fgets(line, sizeof(line), f))
+        for (size_t lineIndex = 1; lineIndex < lines.size(); ++lineIndex)
         {
-            const std::vector<std::string> row = ParseCsvLine(line);
+            if (lines[lineIndex].empty()) continue;
+            const std::vector<std::string> row = ParseCsvLine(lines[lineIndex].c_str());
             uint32_t displayId = 0;
             if (!ParseU32(CsvField(row, cDisplay), &displayId) || displayId == 0) continue;
 
@@ -973,7 +1024,6 @@ namespace wxl::scripts::equipextension
             ++loaded;
         }
 
-        std::fclose(f);
         if (loaded)
             EquipLog("material sidecar loaded '%s' rows=%u", path, loaded);
     }
@@ -1488,7 +1538,7 @@ namespace wxl::scripts::equipextension
         for (auto& e : entries)
         {
             detachOnce(e.attachId);
-            if (e.equipSlot < 11)
+            if (ShouldDetachDefaultAttachPoints(e))
             {
                 detachOnce(kSlotConfig[e.equipSlot].defAttach1);
                 detachOnce(kSlotConfig[e.equipSlot].defAttach2);
@@ -1532,7 +1582,7 @@ namespace wxl::scripts::equipextension
             if (alreadyAttached) continue;
 
             void* rctx = e.renderCtx;
-            bool isCollection = (e.geoFilter.count > 0);
+            bool isCollection = IsCollectionEntry(e);
 
             if (e.texBuf[0])
             {
@@ -1823,6 +1873,8 @@ namespace wxl::scripts::equipextension
                 uint32_t attach = attachForEntry(isCollection, mixedCollectionRow, columnAttach,
                                                  defaultAttach, explicitAttach);
                 attach = InferObjectComponentAttach(stem, isCollection, explicitAttach, attach);
+                if (isCollection && IsCollectionGloveBodyModel(a.modelSlot, stem))
+                    attach = kCollectionAttach;
                 if (attach == static_cast<uint32_t>(-1))
                 {
                     EquipLog("  %s[%u]: attach==-1, skip", label, idx);
@@ -1891,6 +1943,8 @@ namespace wxl::scripts::equipextension
                     (sc.folder[0] && StartsWithCI(sc.folder, "Collections")) ||
                     sc.geoFilter.count > 0 ||
                     StartsWithCI(sc.model, "collections_");
+                if (isCollectionPath && IsCollectionGloveBodyModel(a.modelSlot, sc.model))
+                    attach = kCollectionAttach;
                 if (!isCollectionPath && !SlotAllowsNormalObjectModel(a.modelSlot))
                 {
                     EquipLog("  SC[%u]: normal model '%s' ignored for texture-only slot %u",
@@ -2072,8 +2126,7 @@ namespace wxl::scripts::equipextension
                                     // Keep the texture handle alive for the attached render context.
                                 }
                             }
-                            gm2::DetachSlot(entry.subObj, entry.attachId);
-                            gm2::AttachToScene(rctx, entry.subObj, entry.attachId, entry.geoFilter.count > 0);
+                            gm2::AttachToScene(rctx, entry.subObj, entry.attachId, IsCollectionEntry(entry));
                             for (auto& e2 : entries)
                                 if (e2.renderCtx == renderCtx) e2.renderCtx = rctx;
                             gm2::ReleaseRenderCtx(rctx);
@@ -2096,6 +2149,7 @@ namespace wxl::scripts::equipextension
                 // charCtx is the character's render_ctx (= cmo->sceneNode = the outer frame call).
                 // The collection M2's bone buffer is overwritten with corresponding char matrices.
                 if (entry.geoFilter.count == 0) return;
+                if (entry.boneRemap.count == 0) return;
                 void* charCtx = GuardedReadPtr(reinterpret_cast<uint8_t*>(cmo) + m2::kOffCmoSceneNode);
                 if (charCtx && charCtx != renderCtx)
                 {
