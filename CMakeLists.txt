@@ -17,34 +17,14 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 # DLL needs no x64 toolchain and pays no build/deploy cost. build.ps1 -Host flips it on in an x64 configure.
 option(WXL_BUILD_HOST "Build WarcraftXLHost.exe (64-bit asset host)" OFF)
 
-# wxl-modern-assets per-format toggles: exclude an entire format pipeline (source down-convert, both its
-# DLL and host halves) at configure time, without touching source. common/ and textures/dds stay in
-# unconditionally (shared infrastructure, not format-specific).
-option(WXL_MODERN_M2  "Build wxl-modern-assets M2 support"          ON)
-option(WXL_MODERN_M3  "Build wxl-modern-assets M3 support"          ON)
-option(WXL_MODERN_WMO "Build wxl-modern-assets WMO support"         ON)
-option(WXL_MODERN_BLP "Build wxl-modern-assets BLP/texture support" ON)
+# The modern-assets pipelines now live under src/engine/assets and use the compile switches in
+# src/config.hpp. The remaining external modules stay available until their own core ports land.
 option(WXL_MODERN_RENDER
        "Build the D3D9On12 post-processing renderer"
        ON)
 option(WXL_EXPERIMENTAL_WATER
        "Build the unmasked screen-space water reflection experiment"
        OFF)
-
-set(WXL_MODERN_ASSETS_EXCLUDE_REGEX "")
-if(NOT WXL_MODERN_M2)
-    string(APPEND WXL_MODERN_ASSETS_EXCLUDE_REGEX "|/wxl-modern-assets/(shared|host|src)/models/m2/")
-endif()
-if(NOT WXL_MODERN_M3)
-    string(APPEND WXL_MODERN_ASSETS_EXCLUDE_REGEX "|/wxl-modern-assets/(shared|host|src)/models/m3/")
-endif()
-if(NOT WXL_MODERN_WMO)
-    string(APPEND WXL_MODERN_ASSETS_EXCLUDE_REGEX "|/wxl-modern-assets/(shared|host|src)/models/wmo/")
-endif()
-if(NOT WXL_MODERN_BLP)
-    string(APPEND WXL_MODERN_ASSETS_EXCLUDE_REGEX "|/wxl-modern-assets/(shared|host|src)/textures/blp/")
-endif()
-string(REGEX REPLACE "^\\|" "" WXL_MODERN_ASSETS_EXCLUDE_REGEX "${WXL_MODERN_ASSETS_EXCLUDE_REGEX}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -134,30 +114,32 @@ call \"${WXL_LJ_BUILD_SRC_NATIVE}\\msvcbuild.bat\" static\r
     set(WXL_TWEETNACL "${CMAKE_CURRENT_SOURCE_DIR}/deps/tweetnacl/tweetnacl.c")
 
     # =========================================================================
-    # Target 1: WarcraftXL.dll  (32-bit, injected) = engine + features + runtime scripts
-    #   runtime scripts live in scripts/*/src/*.cpp; the cross-target byte-transform a module shares with
-    #   the host lives in scripts/*/shared/*.cpp. Both compile straight into the DLL (self-registering).
+    # Target 1: WarcraftXL.dll  (32-bit, injected) = engine + features + assets pipelines
+    #   The modern-assets DLL + cross-target-shared halves now live in src/engine/assets/ and are caught
+    #   by the src/*.cpp glob above (the shared half also compiles into the 64-bit host, added there).
     # =========================================================================
+    # Compatibility layer for modules that are not yet represented in core. Modern-assets and the old
+    # grass-motion hook are excluded because their replacements are now compiled from src/.
     file(GLOB_RECURSE WXL_RUNTIME_SCRIPT CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/*/src/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/*/shared/*.cpp")
-    if(WXL_MODERN_ASSETS_EXCLUDE_REGEX)
-        list(FILTER WXL_RUNTIME_SCRIPT EXCLUDE REGEX "${WXL_MODERN_ASSETS_EXCLUDE_REGEX}")
-    endif()
+    list(FILTER WXL_RUNTIME_SCRIPT EXCLUDE REGEX "/wxl-modern-assets/")
+    list(FILTER WXL_RUNTIME_SCRIPT EXCLUDE REGEX
+         "/wxl-modern-render/src/grass/GrassMotion\\.cpp$")
     if(NOT WXL_EXPERIMENTAL_WATER)
         list(FILTER WXL_RUNTIME_SCRIPT EXCLUDE REGEX "/wxl-experimental-water/")
     endif()
     if(NOT WXL_MODERN_RENDER)
         list(FILTER WXL_RUNTIME_SCRIPT EXCLUDE REGEX "/wxl-modern-render/")
     endif()
-
     # Vendored ImGui (core + dx9/win32 backends). Compiled in but DORMANT until a feature wires it up.
     file(GLOB WXL_IMGUI CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/deps/imgui/*.cpp")
 
     # FlatBuffers runtime (flexbuffers string utils) for the host IPC client (engine/storage).
     set(WXL_FLATBUFFERS "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/src/util.cpp")
 
-    add_library(WarcraftXL SHARED ${WXL_CORE_SRC} ${WXL_RUNTIME_SCRIPT} ${WXL_IMGUI} ${WXL_FLATBUFFERS} ${WXL_TWEETNACL})
+    add_library(WarcraftXL SHARED ${WXL_CORE_SRC} ${WXL_RUNTIME_SCRIPT}
+        ${WXL_IMGUI} ${WXL_FLATBUFFERS} ${WXL_TWEETNACL})
     set_target_properties(WarcraftXL PROPERTIES OUTPUT_NAME "WarcraftXL" PREFIX "")
     target_include_directories(WarcraftXL PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -206,12 +188,14 @@ call \"${WXL_LJ_BUILD_SRC_NATIVE}\\msvcbuild.bat\" static\r
         endif()
         include("${_wxl_module}")
     endforeach()
-
     # =========================================================================
-    # Target 2: wxl-patcher.exe  = the offline PE patcher + patcher scripts
+    # Target 2: wxl-patcher.exe = core patchers (including GlueUnlock) plus retained external patchers
+    # that do not yet have a core replacement.
     # =========================================================================
-    file(GLOB_RECURSE WXL_PATCHER_CORE   CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/patcher/*.cpp")
-    file(GLOB_RECURSE WXL_PATCHER_SCRIPT CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/*/patcher/*.cpp")
+    file(GLOB_RECURSE WXL_PATCHER_CORE CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/patcher/*.cpp")
+    file(GLOB_RECURSE WXL_PATCHER_SCRIPT CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/*/patcher/*.cpp")
+    list(FILTER WXL_PATCHER_SCRIPT EXCLUDE REGEX "/wxl-no-gluexml/")
 
     # src/common/ compiles into every binary (leveled logger, config, shared helpers): the patcher and
     # proxy do not link the engine, and the host is another architecture, so the shared infrastructure
@@ -279,8 +263,8 @@ endif()
 
 # =============================================================================
 # 64-bit family (opt-in): WarcraftXLHost.exe = archive owner + IPC transport.
-#   Format-blind: src/host/ + the modules' scripts/*/host/ handlers + their scripts/*/shared/ transforms.
-#   StormLib + FlatBuffers (deps/). Requires an x64 toolchain.
+#   Format-blind: src/host/ (incl. assets/ host handlers + resolver/) + the cross-target byte transforms
+#   shared with the DLL in src/engine/assets/shared/. StormLib + FlatBuffers (deps/). Requires x64.
 # =============================================================================
 if(WXL_BUILD_HOST AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     # StormLib (vendored) supplies MPQ reading. Static, read-only use; no install/tests.
@@ -289,19 +273,25 @@ if(WXL_BUILD_HOST AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/deps/stormlib" "${CMAKE_BINARY_DIR}/stormlib")
 
-    file(GLOB_RECURSE WXL_HOST_CORE   CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/host/*.cpp")
+    # src/host/ = host core + the ex-module host handlers (assets/, resolver/), all self-registering.
+    file(GLOB_RECURSE WXL_HOST_CORE CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/host/*.cpp")
+    # The full external host extension owns the richer resolver, WDC5 snapshots, cache and prefetch service.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/wxl-host-extension/host/db2/Db2Service.cpp")
+        list(FILTER WXL_HOST_CORE EXCLUDE REGEX "/src/host/resolver/")
+    endif()
+    # The cross-target byte transforms shared with the DLL (ex scripts/*/shared) now live here.
+    file(GLOB_RECURSE WXL_HOST_SHARED CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/engine/assets/shared/*.cpp")
     file(GLOB_RECURSE WXL_HOST_SCRIPT CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/*/host/*.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/scripts/*/shared/*.cpp")
-    if(WXL_MODERN_ASSETS_EXCLUDE_REGEX)
-        list(FILTER WXL_HOST_SCRIPT EXCLUDE REGEX "${WXL_MODERN_ASSETS_EXCLUDE_REGEX}")
-    endif()
+    list(FILTER WXL_HOST_SCRIPT EXCLUDE REGEX "/wxl-modern-assets/")
 
     # The shared infrastructure (leveled logger, config) compiles straight into the host too.
     file(GLOB WXL_COMMON_SRC CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/common/*.cpp")
 
     add_executable(WarcraftXLHost
         ${WXL_HOST_CORE}
+        ${WXL_HOST_SHARED}
         ${WXL_HOST_SCRIPT}
         ${WXL_COMMON_SRC}
         "${CMAKE_CURRENT_SOURCE_DIR}/deps/flatbuffers/src/util.cpp")
@@ -315,7 +305,8 @@ if(WXL_BUILD_HOST AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_link_libraries(WarcraftXLHost PRIVATE storm)
     target_compile_definitions(WarcraftXLHost PRIVATE ${WXL_DEFS} WXL_HOST=1)
 
-    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${WXL_HOST_CORE} ${WXL_HOST_SCRIPT})
+    source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES
+        ${WXL_HOST_CORE} ${WXL_HOST_SHARED} ${WXL_HOST_SCRIPT})
 
     # Deploy the host into the client's Utils folder after build.
     if(CLIENT_PATH)
