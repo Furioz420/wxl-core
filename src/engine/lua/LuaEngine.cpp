@@ -22,13 +22,16 @@
 #include "engine/lua/methods/CoreMethods.hpp"
 #include "engine/lua/methods/CameraMethods.hpp"
 #include "engine/lua/methods/UnitMethods.hpp"
-#include "engine/lua/methods/UiMethods.hpp"
 #include "engine/lua/methods/WorldMethods.hpp"
+#include "engine/lua/methods/UiMethods.hpp"
+#include "engine/lua/methods/TextureMethods.hpp"
+#include "engine/lua/ui/Texture.hpp"
 #include "engine/lua/events/EventBridge.hpp"
 #include "engine/lua/events/FrameEvents.hpp"
 #include "engine/lua/events/GameEvents.hpp"
 #include "engine/lua/events/UnitEvents.hpp"
 #include "engine/lua/events/UiEvents.hpp"
+#include "engine/lua/ffi/FfiBootstrap.hpp"
 #include "engine/lua/ObjectProxy.hpp"
 #include "engine/lua/ui/ImGuiHost.hpp"
 #include "engine/events/Event.hpp"
@@ -105,15 +108,19 @@ namespace wxl::lua
         }
         luaL_openlibs(L);
 
-        RegisterMetatables(L); // Unit metatable + weak proxy cache, before the method table is filled
+        ffi::InstallFfi(L); // register engine-internal cdefs + self-check the C++/Lua struct layout
+
+        RegisterMetatables(L);              // Unit metatable + weak proxy cache, before the method table is filled
+        methods::texture::RegisterTextureMeta(L); // "wxl.texture" handle metatable, created once
 
         // Assemble the global `wxl` table: each context adds its fields to the table on top.
         lua_newtable(L);
         methods::core::Register(L);
-        methods::camera::Register(L); // adds the wxl.camera.* subtable
-        methods::unit::Register(L); // fills the Unit __index method table, adds player/target/mouseover
-        methods::ui::Register(L);   // adds the wxl.ui.* subtable
-        methods::world::Register(L); // adds the wxl.world.* subtable
+        methods::camera::Register(L); // adds the wxl.camera subtable (matrices + world_to_screen)
+        methods::unit::Register(L);   // fills the Unit __index method table, adds player/target/mouseover
+        methods::world::Register(L);  // adds the wxl.world subtable (map id/name, viewport)
+        methods::ui::Register(L);     // adds the wxl.ui.* subtable
+        methods::texture::Register(L);// adds the callable wxl.texture (BLP -> IDirect3DTexture9)
         events::Bind(L); // adds wxl.on and binds the bridge to this state
         lua_setglobal(L, "wxl");
 
@@ -133,7 +140,8 @@ namespace wxl::lua
             return;
         AssertGameThread();
 
-        events::Detach(); // drop retained callbacks before the registry is freed
+        events::Detach();  // drop retained callbacks before the registry is freed
+        ui::ReleaseAll();  // release cached D3D textures before the VM/device references go away
         lua_close(g_L);
         g_L = nullptr;
         WLOG_DEBUG("[vm] stopped");
