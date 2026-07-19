@@ -71,3 +71,6 @@ Testing/
 # internal
 docs/
 tools/
+
+# Private extension-signing material must never enter version control.
+/wxl-signing-key.bin
