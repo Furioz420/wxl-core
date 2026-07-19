@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 /// The signed manifest is the trust root for extension loading. On disk it is two files in the
 /// extensions directory:
@@ -58,18 +59,21 @@ namespace wxl::security
     bool LoadAndVerify(const std::wstring& extDir, Manifest& out, std::string& err);
 
     /**
-     * @brief Confirms one file's bytes match its manifest entry.
+     * @brief Reads one file and confirms those exact bytes match its manifest entry.
      *
-     * SHA-512s the file at fullPath and compares to the manifest hash recorded for relPath. Fails
+     * Reads and SHA-512s the file at fullPath, compares it to the manifest hash recorded for relPath,
+     * and returns the verified bytes for execution without reopening the path. Fails
      * when relPath is absent from the manifest ("not listed in manifest"), when the file cannot be
      * read, or when the digest differs ("hash mismatch").
      * @param m        a manifest returned by LoadAndVerify.
      * @param fullPath absolute path of the file to hash (wide path).
      * @param relPath  the file's manifest-relative path (forward slashes; case-insensitive).
+     * @param out      receives the verified file bytes; cleared on failure.
      * @param err      receives a human-readable reason on failure.
      * @return true iff the file is listed and its hash matches.
      */
-    bool VerifyFile(const Manifest& m, const std::wstring& fullPath, const std::string& relPath, std::string& err);
+    bool ReadAndVerifyFile(const Manifest& m, const std::wstring& fullPath, const std::string& relPath,
+                           std::vector<uint8_t>& out, std::string& err);
 
     /**
      * @brief True when the manifest's declared LuaJIT version equals the DLL's embedded LUAJIT_VERSION.

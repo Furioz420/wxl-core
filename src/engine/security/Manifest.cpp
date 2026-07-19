@@ -206,9 +206,10 @@ namespace wxl::security
         return Parse(manifestBytes, out, err);
     }
 
-    bool VerifyFile(const Manifest& m, const std::wstring& fullPath, const std::string& relPath,
-                    std::string& err)
+    bool ReadAndVerifyFile(const Manifest& m, const std::wstring& fullPath, const std::string& relPath,
+                           std::vector<uint8_t>& out, std::string& err)
     {
+        out.clear();
         const auto it = m.files.find(ToLowerAscii(relPath));
         if (it == m.files.end())
         {
@@ -216,16 +217,16 @@ namespace wxl::security
             return false;
         }
 
-        std::vector<uint8_t> bytes;
-        if (!ReadWholeFile(fullPath, bytes))
+        if (!ReadWholeFile(fullPath, out))
         {
             err = "cannot read file";
             return false;
         }
 
-        const std::array<uint8_t, 64> digest = Sha512(bytes.data(), bytes.size());
+        const std::array<uint8_t, 64> digest = Sha512(out.data(), out.size());
         if (digest != it->second)
         {
+            out.clear();
             err = "hash mismatch";
             return false;
         }

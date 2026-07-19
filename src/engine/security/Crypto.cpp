@@ -32,13 +32,23 @@ extern "C"
 // host to define it. It is only reached through crypto_sign_keypair (the wxl-sign tool); the DLL
 // never generates keys, yet still links this definition so the symbol resolves in every binary that
 // pulls in tweetnacl.c. rand_s is the CSPRNG-backed Windows CRT source (needs _CRT_RAND_S above).
+namespace
+{
+    thread_local bool gRandomFailed = false;
+}
+
 extern "C" void randombytes(unsigned char* p, unsigned long long n)
 {
     unsigned long long i = 0;
     while (i < n)
     {
         unsigned int      v     = 0;
-        (void)rand_s(&v); // best-effort; rand_s only fails on a broken CRT, and the DLL never calls this
+        if (rand_s(&v) != 0)
+        {
+            std::memset(p + i, 0, static_cast<size_t>(n - i));
+            gRandomFailed = true;
+            return;
+        }
         const unsigned long long chunk = (n - i < 4) ? (n - i) : 4;
         std::memcpy(p + i, &v, static_cast<size_t>(chunk));
         i += chunk;
@@ -110,9 +120,17 @@ namespace wxl::security
         return rc == 0 && mlen == static_cast<unsigned long long>(msglen);
     }
 
-    void GenerateKeypair(uint8_t pk[32], uint8_t sk[64])
+    bool GenerateKeypair(uint8_t pk[32], uint8_t sk[64])
     {
-        crypto_sign_keypair(pk, sk);
+        gRandomFailed = false;
+        const int rc = crypto_sign_keypair(pk, sk);
+        if (rc != 0 || gRandomFailed)
+        {
+            std::memset(pk, 0, 32);
+            std::memset(sk, 0, 64);
+            return false;
+        }
+        return true;
     }
 
     void SignDetached(const uint8_t sk[64], const void* msg, size_t msglen, uint8_t out_sig[64])

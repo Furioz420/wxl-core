@@ -70,8 +70,9 @@ namespace wxl::security
      * @brief Generates a fresh Ed25519 keypair (tool-only; the DLL never calls this).
      * @param pk  receives the 32-byte public key.
      * @param sk  receives the 64-byte secret key.
+     * @return false when the operating-system CSPRNG or key generation fails; outputs are zeroed.
      */
-    void GenerateKeypair(uint8_t pk[32], uint8_t sk[64]);
+    bool GenerateKeypair(uint8_t pk[32], uint8_t sk[64]);
 
     /**
      * @brief Produces a detached Ed25519 signature over a message (tool-only).

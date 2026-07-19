@@ -59,8 +59,10 @@ namespace wxl::lua::loader
             const int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
             if (n <= 0)
                 return std::wstring();
-            std::wstring w(static_cast<size_t>(n - 1), L'\0');
-            MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), n);
+            std::wstring w(static_cast<size_t>(n), L'\0');
+            if (MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), n) != n)
+                return std::wstring();
+            w.pop_back();
             return w;
         }
 
@@ -138,11 +140,12 @@ namespace wxl::lua::loader
         {
             char path[MAX_PATH];
             std::snprintf(path, sizeof(path), "%s\\%s", dir, f.c_str());
+            std::vector<uint8_t> verifiedBytes;
 
             if (!dev)
             {
                 std::string err;
-                if (!security::VerifyFile(manifest, Widen(path), f, err))
+                if (!security::ReadAndVerifyFile(manifest, Widen(path), f, verifiedBytes, err))
                 {
                     WLOG_WARN("[vm] skipping %s: %s", f.c_str(), err.c_str());
                     continue;
@@ -155,10 +158,17 @@ namespace wxl::lua::loader
                     continue;
                 }
             }
-            // luaL_loadfile pushes either the compiled chunk or an error string; a failed pcall
-            // pushes the runtime error. Either way the stack is restored before the next file so a
-            // failing extension cannot leak state onto the shared stack.
-            if (luaL_loadfile(L, path) != 0)
+            // Production executes the exact bytes that passed the manifest hash check, closing the
+            // check/use race that reopening the path with luaL_loadfile would create. Dev mode keeps
+            // direct file loading because its signature gate is intentionally disabled.
+            const std::string chunkName = "@" + std::string(path);
+            const char* verifiedData = verifiedBytes.empty()
+                ? ""
+                : reinterpret_cast<const char*>(verifiedBytes.data());
+            const int loadRc = dev
+                ? luaL_loadfile(L, path)
+                : luaL_loadbuffer(L, verifiedData, verifiedBytes.size(), chunkName.c_str());
+            if (loadRc != 0)
             {
                 WLOG_ERROR("[vm] compile failed %s: %s", f.c_str(), lua_tostring(L, -1));
                 lua_pop(L, 1);

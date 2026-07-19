@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "engine/security/Crypto.hpp"
+#include "engine/security/PublicKey.hpp"
 
 #include "common/Log.hpp"
 
@@ -159,7 +160,11 @@ namespace
 
         uint8_t pk[32];
         uint8_t sk[64];
-        wxl::security::GenerateKeypair(pk, sk);
+        if (!wxl::security::GenerateKeypair(pk, sk))
+        {
+            WLOG_ERROR("secure key generation failed");
+            return 1;
+        }
 
         if (!WriteAll(key, sk, sizeof(sk)))
         {
@@ -197,6 +202,20 @@ namespace
         if (!ReadAll(key, sk) || sk.size() != 64)
         {
             WLOG_ERROR("cannot read 64-byte secret key '%s'", key.c_str());
+            return 1;
+        }
+        if (!std::equal(sk.begin() + 32, sk.end(), wxl::security::kEd25519PublicKey))
+        {
+            WLOG_ERROR("secret key '%s' does not match the public key embedded in this build", key.c_str());
+            return 1;
+        }
+        constexpr char kKeyProbe[] = "WarcraftXL extension signing key check";
+        uint8_t probeSignature[64];
+        wxl::security::SignDetached(sk.data(), kKeyProbe, sizeof(kKeyProbe) - 1, probeSignature);
+        if (!wxl::security::VerifyDetached(wxl::security::kEd25519PublicKey,
+                                          kKeyProbe, sizeof(kKeyProbe) - 1, probeSignature))
+        {
+            WLOG_ERROR("secret key '%s' fails a signing check against the embedded public key", key.c_str());
             return 1;
         }
 
