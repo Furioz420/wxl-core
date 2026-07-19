@@ -31,6 +31,8 @@
 // request wins.
 namespace wxl::host
 {
+    namespace mpq { class MpqStore; }
+
     /**
      * @brief Reshapes raw archive bytes for `name`; returns true when the hook produced output.
      * @param name  archive-internal file name being served
@@ -171,6 +173,29 @@ namespace wxl::host
      * @return client data root path
      */
     std::string ClientRoot();
+
+    // --- request-local archive access ---
+
+    /**
+     * @brief Binds the archive store owned by the current host worker thread.
+     *
+     * Transform hooks occasionally need a sibling file (for example a modern M2's .skel). Reusing the
+     * worker's store avoids mounting another complete StormLib archive set inside each module/thread.
+     * The caller owns `store` and must keep it alive until the worker stops using the host pipeline.
+     * @param store  current worker's archive store, or nullptr to clear the binding
+     */
+    void SetThreadArchiveStore(mpq::MpqStore* store) noexcept;
+
+    /** @brief Reports whether the current thread has a worker-owned archive store bound. */
+    bool HasThreadArchiveStore() noexcept;
+
+    /**
+     * @brief Reads a raw sibling through the archive store bound to the current worker.
+     * @param name  archive-internal file name
+     * @param out   receives the raw bytes
+     * @return false when no worker store is bound or the file is absent
+     */
+    bool ReadThreadArchive(std::string_view name, std::vector<uint8_t>& out);
 
     // --- texture provenance (cold boundary; a resolver call site marks a texture path it just resolved for
     //     a modern M2/WMO/ADT source, so a byte-transform that must not touch native content -- e.g. the BLP

@@ -52,6 +52,23 @@ namespace wxl::host::produce
             return true;
         }
 
+        bool StartsWithPathCI(std::string_view s, const char* prefix)
+        {
+            const size_t lp = std::strlen(prefix);
+            if (lp > s.size()) return false;
+            for (size_t i = 0; i < lp; ++i)
+            {
+                char a = s[i];
+                char b = prefix[i];
+                if (a == '/') a = '\\';
+                if (b == '/') b = '\\';
+                a = static_cast<char>(std::tolower(static_cast<unsigned char>(a)));
+                b = static_cast<char>(std::tolower(static_cast<unsigned char>(b)));
+                if (a != b) return false;
+            }
+            return true;
+        }
+
         void AddUniqueAlias(std::vector<std::string>& aliases, const std::string& original, std::string alias)
         {
             if (alias.empty() || alias == original) return;
@@ -289,6 +306,23 @@ namespace wxl::host::produce
             alias.replace(0, fileStart + 1, kCollectionPrefix);
             AddUniqueAlias(aliases, name, std::move(alias));
         }
+    }
+
+    bool MayHaveAliases(std::string_view name)
+    {
+        const bool texture = EndsWithCI(name, ".blp") || EndsWithCI(name, ".tga");
+        if (texture)
+        {
+            const size_t slash = name.find_last_of("\\/");
+            const size_t fileStart = (slash == std::string_view::npos) ? 0 : slash + 1;
+            if (name.find(';', fileStart) != std::string_view::npos)
+                return true;
+        }
+
+        if (StartsWithPathCI(name, "item\\objectcomponents\\"))
+            return texture || EndsWithCI(name, ".m2") || EndsWithCI(name, ".mdx") || EndsWithCI(name, ".skin");
+
+        return texture && StartsWithPathCI(name, "item\\texturecomponents\\");
     }
 
     void BuildAliases(const std::string& name, std::vector<std::string>& aliases)

@@ -42,6 +42,9 @@ namespace wxl::host::produce
      */
     bool ArchiveExists(std::string_view name);
 
+    /** @brief Worker-store overload of ArchiveExists; keeps StormLib handles local to a reader lane. */
+    bool ArchiveExists(std::string_view name, wxl::host::mpq::MpqStore& store);
+
     /**
      * @brief Forces the pipeline to serve stock-archive content instead of deferring it to the client.
      *        Used by the offline --provide dump, which must resolve native content too.
@@ -77,6 +80,11 @@ namespace wxl::host::produce
     bool ProduceCandidate(const std::string& requestName, const std::string& readName,
                           std::vector<uint8_t>& out, profile::OpenTrace& trace, bool& nativeHit);
 
+    /** @brief Worker-store overload of ProduceCandidate. */
+    bool ProduceCandidate(const std::string& requestName, const std::string& readName,
+                          std::vector<uint8_t>& out, profile::OpenTrace& trace, bool& nativeHit,
+                          wxl::host::mpq::MpqStore& store);
+
     /**
      * @brief Produces the bytes for a client open: direct candidate first, then the name aliases.
      * @param name   requested file name
@@ -85,6 +93,10 @@ namespace wxl::host::produce
      * @return true if the file (or one of its aliases) produced bytes
      */
     bool ProduceServed(const std::string& name, std::vector<uint8_t>& out, profile::OpenTrace& trace);
+
+    /** @brief Worker-store overload of ProduceServed. */
+    bool ProduceServed(const std::string& name, std::vector<uint8_t>& out, profile::OpenTrace& trace,
+                       wxl::host::mpq::MpqStore& store);
 
     /**
      * @brief Samples transform-cache residency for a periodic profile report.

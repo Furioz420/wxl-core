@@ -78,6 +78,8 @@ namespace wxl::host::mpq
         const size_t slash = lower.find_last_of('\\');
         if (slash == std::string::npos || slash + 1 >= lower.size()) return {};
 
+        EnsureItemIndex();
+
         const std::string file = lower.substr(slash + 1);
         const std::string* best = FindIndexed(lower, file);
         if (!best)
@@ -117,7 +119,7 @@ namespace wxl::host::mpq
         return false;
     }
 
-    Source MpqStore::LocateAndRead(std::string_view rawName, bool readStandard,
+    Source MpqStore::LocateAndRead(std::string_view rawName, StandardMode standardMode,
                                    std::vector<uint8_t>& out) const
     {
         const std::string name = NormalizeName(rawName);
@@ -127,32 +129,52 @@ namespace wxl::host::mpq
         {
             std::ifstream f(lr + name, std::ios::binary | std::ios::ate);
             if (!f) continue;
-            std::streamoff size = f.tellg();
+            const std::streamoff size = f.tellg();
+            if (size < 0) continue;
             f.seekg(0);
             out.resize(static_cast<size_t>(size));
-            if (size) f.read(reinterpret_cast<char*>(out.data()), size);
+            if (size)
+            {
+                f.read(reinterpret_cast<char*>(out.data()), size);
+                if (f.gcount() != size)
+                {
+                    out.clear();
+                    continue;
+                }
+            }
             return Source::Loose;
         }
 
         for (size_t i = 0; i < m_archives.size(); ++i)
         {
+            // Mount order is all Extra archives followed by all Standard archives. When the caller has no
+            // aliases to protect, an override miss and a stock hit both defer to the client, so probing the
+            // stock half would only rediscover a decision already made.
+            if (standardMode == StandardMode::Ignore && !m_archiveIsExtra[i]) break;
+
             std::lock_guard<std::mutex> lock(*m_archiveLocks[i]);
             HANDLE hFile = nullptr;
             if (!SFileOpenFileEx(static_cast<HANDLE>(m_archives[i]), name.c_str(), 0, &hFile) || !hFile) continue;
             const Source source = m_archiveIsExtra[i] ? Source::Extra : Source::Standard;
-            if (source == Source::Standard && !readStandard)
+            if (source == Source::Standard && standardMode == StandardMode::Locate)
             {
                 SFileCloseFile(hFile);
                 return source; // caller answers native-skip without paying the read
             }
             DWORD high = 0;
             DWORD sz = SFileGetFileSize(hFile, &high);
-            if (sz == SFILE_INVALID_SIZE) { SFileCloseFile(hFile); continue; }
+            if (sz == SFILE_INVALID_SIZE || high != 0) { SFileCloseFile(hFile); continue; }
             out.resize(sz);
             if (sz)
             {
                 DWORD read = 0;
                 SFileReadFile(hFile, out.data(), sz, &read, nullptr); // FALSE at exact EOF is fine
+                if (read != sz)
+                {
+                    out.clear();
+                    SFileCloseFile(hFile);
+                    continue;
+                }
             }
             SFileCloseFile(hFile);
             return source;
@@ -189,10 +211,19 @@ namespace wxl::host::mpq
         {
             std::ifstream f(lr + name, std::ios::binary | std::ios::ate);
             if (!f) continue;
-            std::streamoff size = f.tellg();
+            const std::streamoff size = f.tellg();
+            if (size < 0) continue;
             f.seekg(0);
             out.resize(static_cast<size_t>(size));
-            if (size) f.read(reinterpret_cast<char*>(out.data()), size);
+            if (size)
+            {
+                f.read(reinterpret_cast<char*>(out.data()), size);
+                if (f.gcount() != size)
+                {
+                    out.clear();
+                    continue;
+                }
+            }
             return true;
         }
 
@@ -203,12 +234,18 @@ namespace wxl::host::mpq
             if (!SFileOpenFileEx(static_cast<HANDLE>(m_archives[i]), name.c_str(), 0, &hFile) || !hFile) continue;
             DWORD high = 0;
             DWORD sz = SFileGetFileSize(hFile, &high);
-            if (sz == SFILE_INVALID_SIZE) { SFileCloseFile(hFile); continue; }
+            if (sz == SFILE_INVALID_SIZE || high != 0) { SFileCloseFile(hFile); continue; }
             out.resize(sz);
             if (sz)
             {
                 DWORD read = 0;
                 SFileReadFile(hFile, out.data(), sz, &read, nullptr); // FALSE at exact EOF is fine
+                if (read != sz)
+                {
+                    out.clear();
+                    SFileCloseFile(hFile);
+                    continue;
+                }
             }
             SFileCloseFile(hFile);
             return true;

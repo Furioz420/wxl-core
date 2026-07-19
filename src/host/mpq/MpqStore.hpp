@@ -39,6 +39,14 @@ namespace wxl::host::mpq
         Standard, // stock base/locale/patch archive the client also mounts natively
     };
 
+    /** @brief How LocateAndRead handles stock archives after loose/custom sources miss. */
+    enum class StandardMode : uint8_t
+    {
+        Ignore, // stop before stock archives; caller will defer the original name to the client
+        Locate, // report a stock hit without reading its bytes
+        Read,   // read stock bytes normally (aliases and offline --provide)
+    };
+
     /** @brief Mounts the client archive set and serves raw file bytes from it. */
     class MpqStore
     {
@@ -46,9 +54,17 @@ namespace wxl::host::mpq
         /**
          * @brief Mounts the client archive set: locale and base archives plus loose Patch*.MPQ override folders.
          * @param dataDir  client data root
+         * @param logDetails  logs the full mounted-archive list when true; reader-pool clones pass false
          * @return true if at least one archive or loose root mounted
          */
-        bool Mount(std::string_view dataDir);
+        bool Mount(std::string_view dataDir, bool logDetails = true);
+
+        /**
+         * @brief Reports whether another store mounted the identical ordered archive/loose-root set.
+         * @param other  independently mounted store to compare
+         * @return true when both stores will resolve every name through the same source priority
+         */
+        bool HasSameMount(const MpqStore& other) const;
 
         /**
          * @brief Reports whether `name` exists in any mounted archive or loose root.
@@ -97,22 +113,25 @@ namespace wxl::host::mpq
          *
          * Locate-then-ReadAll walks (and locks) every archive twice per served file; this fuses
          * them: the first source that has the file wins, and its bytes are read in place — except
-         * a Standard hit with readStandard=false, which reports the source without reading so the
-         * caller can hand the open to the client's native archives (the native-skip fast path).
+         * StandardMode::Locate reports a stock hit without reading so the caller can hand the open to the
+         * client's native archives. StandardMode::Ignore stops after custom archives; this is safe when the caller
+         * will defer either a stock hit or a complete miss to the client and has no aliases to preserve.
          * @param name          file name to read
-         * @param readStandard  false to skip reading bytes from a Standard (stock) archive hit
+         * @param standardMode  whether stock archives are ignored, located, or read
          * @param out           receives the file bytes (untouched on None / unread Standard)
          * @return the winning source kind, or Source::None
          */
-        Source LocateAndRead(std::string_view name, bool readStandard, std::vector<uint8_t>& out) const;
+        Source LocateAndRead(std::string_view name, StandardMode standardMode,
+                             std::vector<uint8_t>& out) const;
 
         /** @brief Closes all open archive handles. */
         ~MpqStore();
 
     private:
-        void IndexLooseRoot(const std::string& root);
-        void IndexArchiveListfile(void* archive);
-        void AddIndexEntry(const std::string& path);
+        void EnsureItemIndex() const;
+        void IndexLooseRoot(const std::string& root) const;
+        void IndexArchiveListfile(void* archive) const;
+        void AddIndexEntry(const std::string& path) const;
         const std::string* FindIndexed(const std::string& requestLower, const std::string& fileKey) const;
 
         // Highest priority first (search order). StormLib handles mutate on read, so mutable.
@@ -126,6 +145,10 @@ namespace wxl::host::mpq
         std::string                m_locale;       // detected locale folder name
 
         // File-name lookup over the item subtree: lowercase file name -> mounted paths, priority order.
-        std::unordered_map<std::string, std::vector<std::string>> m_itemIndex;
+        // No current open path needs this fallback, so build it lazily on the first actual lookup instead
+        // of walking every loose Item tree and archive listfile for each independent MpqStore mount.
+        mutable std::mutex m_itemIndexMutex;
+        mutable bool m_itemIndexBuilt = false;
+        mutable std::unordered_map<std::string, std::vector<std::string>> m_itemIndex;
     };
 }

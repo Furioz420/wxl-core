@@ -90,9 +90,10 @@ namespace wxl::host::serve
          * @param name   file name (logging)
          * @param bytes  the file bytes to return
          * @param trace  per-open counters and stage timings
+         * @param responseBlobId receives the blob reference owned by this response, if any
          */
         void RespondWithFile(flexbuffers::Builder& fbb, const char* name, std::vector<uint8_t>&& bytes,
-                             hprof::OpenTrace& trace)
+                             hprof::OpenTrace& trace, uint32_t& responseBlobId)
         {
             uint32_t size = static_cast<uint32_t>(bytes.size());
             if (size > kInlineMax)
@@ -103,6 +104,7 @@ namespace wxl::host::serve
                 trace.blobTicks += hprof::Now() - started;
                 if (id != 0)
                 {
+                    responseBlobId = id;
                     trace.ok = true;
                     trace.bytes = size;
                     trace.sharedBytes += size;
@@ -132,8 +134,11 @@ namespace wxl::host::serve
          * @param fbb   FlexBuffers builder receiving the response
          * @param name  file name requested
          * @param trace receives the open-stage measurements and outcome
+         * @param responseBlobId receives the blob reference owned by this response, if any
+         * @param archiveStore reader lane assigned to the current worker
          */
-        void HandleFileOpen(flexbuffers::Builder& fbb, const std::string& name, hprof::OpenTrace& trace)
+        void HandleFileOpen(flexbuffers::Builder& fbb, const std::string& name, hprof::OpenTrace& trace,
+                            uint32_t& responseBlobId, MpqStore& archiveStore)
         {
             std::vector<uint8_t> provided;
             ++trace.providerCalls;
@@ -143,12 +148,12 @@ namespace wxl::host::serve
             if (providerHit)
             {
                 ++trace.providerHits;
-                RespondWithFile(fbb, name.c_str(), std::move(provided), trace);
+                RespondWithFile(fbb, name.c_str(), std::move(provided), trace, responseBlobId);
                 return;
             }
 
             std::vector<uint8_t> served;
-            if (!produce::ProduceServed(name, served, trace))
+            if (!produce::ProduceServed(name, served, trace, archiveStore))
             {
                 trace.miss = true;
                 fbb.Vector([&]() { fbb.UInt(StNotFound); fbb.UInt(0); fbb.UInt(0); });
@@ -160,7 +165,7 @@ namespace wxl::host::serve
             const uint64_t servedStarted = hprof::Now();
             wxl::host::NotifyServed(name, served);
             trace.servedTicks += hprof::Now() - servedStarted;
-            RespondWithFile(fbb, name.c_str(), std::move(served), trace);
+            RespondWithFile(fbb, name.c_str(), std::move(served), trace, responseBlobId);
         }
 
         /**
@@ -202,9 +207,12 @@ namespace wxl::host::serve
          * @param fbb    fresh builder that receives the finished response; the caller posts
          *               fbb.GetBuffer() directly so the payload is never copied host-side
          * @param trace  receives decoded operation, outcome, and open-stage data
+         * @param responseBlobId receives a blob reference that must be released if posting fails
+         * @param archiveStore reader lane assigned to the current worker
          */
         void ProcessRequest(const std::vector<uint8_t>& req, flexbuffers::Builder& fbb,
-                            hprof::RequestTrace& trace)
+                            hprof::RequestTrace& trace, uint32_t& responseBlobId,
+                            MpqStore& archiveStore)
         {
             if (!req.empty())
             {
@@ -215,7 +223,7 @@ namespace wxl::host::serve
                 case OpFileOpen:
                     trace.op = hprof::RequestOp::FileOpen;
                     trace.name = vec[1].AsString().str();
-                    HandleFileOpen(fbb, trace.name, trace.open);
+                    HandleFileOpen(fbb, trace.name, trace.open, responseBlobId, archiveStore);
                     trace.ok = trace.open.ok;
                     trace.bytes = trace.open.bytes;
                     break;
@@ -231,7 +239,7 @@ namespace wxl::host::serve
                 {
                     trace.op = hprof::RequestOp::FileExists;
                     std::string name = vec[1].AsString().str();
-                    bool ok = produce::ArchiveExists(name) || wxl::host::Exists(name);
+                    bool ok = produce::ArchiveExists(name, archiveStore) || wxl::host::Exists(name);
                     trace.ok = ok;
                     fbb.Vector([&]() { fbb.UInt(ok ? StOk : StNotFound); });
                     break;
@@ -280,8 +288,40 @@ namespace wxl::host::serve
         wxl::host::SetClientRoot(clientRoot);
 
         auto mpq = std::make_unique<MpqStore>();
-        mpq->Mount(clientRoot);
+        if (!mpq->Mount(clientRoot))
+        {
+            WLOG_WARN("host: primary archive mount failed; refusing to serve an empty archive view");
+            return 1;
+        }
+        MpqStore* primaryArchiveStore = mpq.get();
         produce::SetMpqStore(std::move(mpq));
+
+        // StormLib does not support concurrent operations on one archive handle. A single shared store made
+        // all seven serve workers queue behind the same hot patch archive, so a tiny texture could wait
+        // hundreds of milliseconds behind an unrelated large model. Keep a small, bounded set of completely
+        // independent archive handles instead. Workers are assigned to a stable reader lane; the locks inside
+        // each store still protect workers sharing that lane. Two lanes is the conservative measured default;
+        // the config knob permits 1..8 for other storage configurations.
+        const uint32_t requestedArchiveReaders = static_cast<uint32_t>(
+            wxl::config::U64("WXL_HOST_ARCHIVE_READERS", 2, 1, 8));
+        std::vector<std::unique_ptr<MpqStore>> ownedArchiveReaders;
+        std::vector<MpqStore*> archiveReaders{ primaryArchiveStore };
+        const ULONGLONG archiveReadersStarted = GetTickCount64();
+        for (uint32_t i = 1; i < requestedArchiveReaders; ++i)
+        {
+            auto reader = std::make_unique<MpqStore>();
+            if (!reader->Mount(clientRoot, false) || !reader->HasSameMount(*primaryArchiveStore))
+            {
+                WLOG_WARN("host: archive reader %u mount failed; continuing with %zu lane(s)",
+                          i + 1, archiveReaders.size());
+                continue;
+            }
+            archiveReaders.push_back(reader.get());
+            ownedArchiveReaders.push_back(std::move(reader));
+        }
+        WLOG_INFO("host: archive readers=%zu requested=%u mounted in %llu ms",
+                  archiveReaders.size(), requestedArchiveReaders,
+                  static_cast<unsigned long long>(GetTickCount64() - archiveReadersStarted));
 
         // List the registered hooks (module host faces self-registered before main ran).
         wxl::host::LogRegisteredHandlers();
@@ -307,38 +347,46 @@ namespace wxl::host::serve
         // is free, rather than one thread being tied to one channel -- so a burst larger than the worker
         // count still queues on the (idle, cheap) channel events instead of spinning up one CPU-bound
         // thread per logical core and starving the game client running on the same machine.
-        auto worker = []() {
+        auto worker = [](MpqStore* archiveStore) {
+            wxl::host::SetThreadArchiveStore(archiveStore);
             std::vector<uint8_t> req;
             for (;;)
             {
                 uint32_t ch = 0, reqSeq = 0;
                 if (!wxl::host::ipc::WaitAnyRequest(ch, reqSeq, req)) break;
                 hprof::RequestTrace trace;
+                uint32_t responseBlobId = 0;
                 const uint64_t requestStarted = hprof::Now();
                 flexbuffers::Builder fbb;
-                ProcessRequest(req, fbb, trace);
+                ProcessRequest(req, fbb, trace, responseBlobId, *archiveStore);
                 const uint64_t postStarted = hprof::Now();
-                wxl::host::ipc::PostResponse(ch, reqSeq, fbb.GetBuffer());
+                const bool published = wxl::host::ipc::PostResponse(ch, reqSeq, fbb.GetBuffer());
+                // A shared-section reference belongs to the response, not merely to its production. If the
+                // response could not be published because its sequence was abandoned, no client owns it.
+                if (!published && responseBlobId) blobs::Close(responseBlobId);
                 const uint64_t requestFinished = hprof::Now();
 
-                // Profile.cpp keeps a compact non-atomic window. Serialize only its bookkeeping; archive
-                // reads and transforms remain fully concurrent across the worker pool.
-                std::lock_guard<std::mutex> profileLock(g_profileMutex);
-                hprof::RecordRequest(trace, requestFinished - requestStarted,
-                                     requestFinished - postStarted);
-                if (hprof::ReportDue())
+                // Profile.cpp keeps a compact non-atomic window. Avoid even taking its global mutex when
+                // profiling is disabled; otherwise every request still serialized around a no-op recorder.
+                if (wxl::host::ProfilingEnabled())
                 {
-                    hprof::Report(SnapshotProfileGauges());
-                    wxl::host::LogAndResetHandlerProfile();
+                    std::lock_guard<std::mutex> profileLock(g_profileMutex);
+                    hprof::RecordRequest(trace, requestFinished - requestStarted,
+                                         requestFinished - postStarted);
+                    if (hprof::ReportDue())
+                    {
+                        hprof::Report(SnapshotProfileGauges());
+                        wxl::host::LogAndResetHandlerProfile();
+                    }
                 }
             }
         };
 
         std::vector<std::thread> workers;
         for (uint32_t w = 1; w < workerCount; ++w)
-            workers.emplace_back(worker);
+            workers.emplace_back(worker, archiveReaders[w % archiveReaders.size()]);
 
-        worker(); // this thread is also a pool worker; its loop only ends at process teardown
+        worker(archiveReaders[0]); // this thread is also a pool worker; its loop ends at process teardown
         for (auto& t : workers) t.join();
         return 0;
     }

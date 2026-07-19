@@ -118,6 +118,7 @@ namespace
         wxl::host::SetClientRoot(clientRoot);
         auto mpq = std::make_unique<MpqStore>();
         mpq->Mount(clientRoot);
+        wxl::host::SetThreadArchiveStore(mpq.get());
         wxl::host::produce::SetMpqStore(std::move(mpq));
         wxl::host::LogRegisteredHandlers();
 

@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "Host.hpp"
+#include "mpq/MpqStore.hpp"
 
 #include <cctype>
 #include <mutex>
@@ -24,6 +25,11 @@
 
 namespace wxl::host
 {
+    namespace
+    {
+        thread_local mpq::MpqStore* g_threadArchiveStore = nullptr;
+    }
+
     /** @brief Returns the storage holding the client data root. */
     std::string& ClientRootRef() { static std::string s; return s; }
     /**
@@ -33,6 +39,21 @@ namespace wxl::host
     void SetClientRoot(std::string_view root) { ClientRootRef().assign(root); }
     /** @brief Returns the client data root. */
     std::string ClientRoot() { return ClientRootRef(); }
+
+    void SetThreadArchiveStore(mpq::MpqStore* store) noexcept
+    {
+        g_threadArchiveStore = store;
+    }
+
+    bool HasThreadArchiveStore() noexcept
+    {
+        return g_threadArchiveStore != nullptr;
+    }
+
+    bool ReadThreadArchive(std::string_view name, std::vector<uint8_t>& out)
+    {
+        return g_threadArchiveStore && g_threadArchiveStore->ReadAll(name, out);
+    }
 
     namespace
     {

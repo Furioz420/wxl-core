@@ -82,6 +82,22 @@ namespace
         return false;
     }
 
+    uint64_t LoosePatchRank(const std::string& name)
+    {
+        const std::string lower = ToLower(name);
+        if (lower == "patch.mpq") return 0;
+        constexpr std::string_view prefix = "patch-";
+        constexpr std::string_view suffix = ".mpq";
+        if (lower.rfind(prefix, 0) != 0 || lower.size() <= prefix.size() + suffix.size() ||
+            lower.substr(lower.size() - suffix.size()) != suffix)
+            return 0;
+
+        uint64_t rank = 0;
+        const std::string token = lower.substr(prefix.size(),
+            lower.size() - prefix.size() - suffix.size());
+        return PatchTokenRank(token, rank) ? rank : 0;
+    }
+
     void CollectPatchArchives(const std::string& root,
                               const std::string& relDir,
                               const std::string& prefix,
@@ -118,12 +134,20 @@ namespace
 
 namespace wxl::host::mpq
 {
+    bool MpqStore::HasSameMount(const MpqStore& other) const
+    {
+        return m_archiveNames == other.m_archiveNames
+            && m_archiveIsExtra == other.m_archiveIsExtra
+            && m_looseRoots == other.m_looseRoots
+            && m_locale == other.m_locale;
+    }
+
     /**
      * @brief Mounts the locale and base archives plus loose override folders under the data root.
      * @param dataDir  client data root
      * @return true if at least one archive or loose root mounted
      */
-    bool MpqStore::Mount(std::string_view dataDir)
+    bool MpqStore::Mount(std::string_view dataDir, bool logDetails)
     {
         std::string root(dataDir);
         if (!root.empty() && (root.back() == '\\' || root.back() == '/')) root.pop_back();
@@ -139,6 +163,7 @@ namespace wxl::host::mpq
         m_archiveLocks.clear();
         m_looseRoots.clear();
         m_itemIndex.clear();
+        m_itemIndexBuilt = false;
 
         // One pass over Data\* finds the locale folder (carries locale-<loc>.MPQ) and loose override
         // folders (Data\Patch*.MPQ that are DIRECTORIES, highest priority). Real custom archives are
@@ -171,7 +196,10 @@ namespace wxl::host::mpq
         const std::string loc = m_locale;
 
         std::sort(looseDirs.begin(), looseDirs.end(), [](const std::string& a, const std::string& b) {
-            return ToLower(a) > ToLower(b); // Patch-5 before Patch-4 ...
+            const uint64_t ar = LoosePatchRank(a);
+            const uint64_t br = LoosePatchRank(b);
+            if (ar != br) return ar > br; // Patch-10 before Patch-9; Patch-B before Patch-A.
+            return ToLower(a) > ToLower(b);
         });
         for (const std::string& d : looseDirs) m_looseRoots.push_back(data + "\\" + d + "\\");
 
@@ -234,30 +262,44 @@ namespace wxl::host::mpq
         }
         const ULONGLONG mountMs = GetTickCount64() - t0;
 
-        // By-name index over the item subtree, same priority order as the read path.
-        const ULONGLONG i0 = GetTickCount64();
-        for (const std::string& lr : m_looseRoots) IndexLooseRoot(lr);
-        for (void* a : m_archives) IndexArchiveListfile(a);
-        const ULONGLONG indexMs = GetTickCount64() - i0;
-
-        WLOG_INFO("mpq: locale=%s, %zu archives, %zu loose roots, mounted in %llu ms",
-            m_locale.empty() ? "(none)" : m_locale.c_str(), m_archives.size(), m_looseRoots.size(),
-            static_cast<unsigned long long>(mountMs));
-        WLOG_INFO("mpq: item index: %zu names in %llu ms",
-            m_itemIndex.size(), static_cast<unsigned long long>(indexMs));
-        for (size_t i = 0; i < m_archiveNames.size(); ++i)
-            WLOG_INFO("mpq:   [%zu] %s", i, m_archiveNames[i].c_str());
-        for (const std::string& lr : m_looseRoots)
-            WLOG_INFO("mpq:   loose <- %s", lr.c_str());
+        if (logDetails)
+        {
+            WLOG_INFO("mpq: locale=%s, %zu archives, %zu loose roots, mounted in %llu ms",
+                m_locale.empty() ? "(none)" : m_locale.c_str(), m_archives.size(), m_looseRoots.size(),
+                static_cast<unsigned long long>(mountMs));
+            for (size_t i = 0; i < m_archiveNames.size(); ++i)
+                WLOG_INFO("mpq:   [%zu] %s", i, m_archiveNames[i].c_str());
+            for (const std::string& lr : m_looseRoots)
+                WLOG_INFO("mpq:   loose <- %s", lr.c_str());
+        }
 
         return !m_archives.empty() || !m_looseRoots.empty();
+    }
+
+    /** @brief Builds the by-file-name Item index on the first caller that actually needs it. */
+    void MpqStore::EnsureItemIndex() const
+    {
+        std::lock_guard<std::mutex> buildLock(m_itemIndexMutex);
+        if (m_itemIndexBuilt) return;
+
+        const ULONGLONG started = GetTickCount64();
+        for (const std::string& root : m_looseRoots)
+            IndexLooseRoot(root);
+        for (size_t i = 0; i < m_archives.size(); ++i)
+        {
+            std::lock_guard<std::mutex> archiveLock(*m_archiveLocks[i]);
+            IndexArchiveListfile(m_archives[i]);
+        }
+        m_itemIndexBuilt = true;
+        WLOG_INFO("mpq: lazy item index: %zu names in %llu ms", m_itemIndex.size(),
+            static_cast<unsigned long long>(GetTickCount64() - started));
     }
 
     /**
      * @brief Records one mounted path in the file-name index if it belongs to the item subtree.
      * @param path  archive-internal path, backslash separators
      */
-    void MpqStore::AddIndexEntry(const std::string& path)
+    void MpqStore::AddIndexEntry(const std::string& path) const
     {
         const std::string lower = ToLower(path);
         if (lower.rfind(kIndexPrefix, 0) != 0) return;
@@ -274,7 +316,7 @@ namespace wxl::host::mpq
      * @brief Walks the Item folder of a loose root and indexes every file found.
      * @param root  absolute loose root path, trailing slash
      */
-    void MpqStore::IndexLooseRoot(const std::string& root)
+    void MpqStore::IndexLooseRoot(const std::string& root) const
     {
         std::vector<std::string> pending;
         pending.emplace_back("Item");
@@ -304,7 +346,7 @@ namespace wxl::host::mpq
      * @brief Reads the archive's (listfile) by exact name and indexes its item entries.
      * @param archive  StormLib archive HANDLE
      */
-    void MpqStore::IndexArchiveListfile(void* archive)
+    void MpqStore::IndexArchiveListfile(void* archive) const
     {
         HANDLE hFile = nullptr;
         if (!SFileOpenFileEx(static_cast<HANDLE>(archive), "(listfile)", 0, &hFile) || !hFile) return;

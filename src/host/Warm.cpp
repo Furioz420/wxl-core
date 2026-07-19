@@ -19,6 +19,7 @@
 #include "Host.hpp"
 #include "Produce.hpp"
 #include "Profile.hpp"
+#include "common/Config.hpp"
 
 #include <windows.h>
 #include <cctype>
@@ -41,6 +42,12 @@ namespace wxl::host::warm
         std::condition_variable         g_warmCv;
         std::deque<std::string>         g_warmQueue;
         std::unordered_set<std::string> g_warmSeen;
+
+        bool TileWarmEnabled()
+        {
+            static const bool enabled = wxl::config::Env("WXL_HOST_TILE_WARM", true);
+            return enabled;
+        }
 
         /**
          * @brief Splits a normalized "<prefix>_<x>_<y>.adt" tile key into its parts.
@@ -75,6 +82,12 @@ namespace wxl::host::warm
         DWORD WINAPI TileWarmer(LPVOID)
         {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            // Never make background terrain work share a StormLib handle with a live serve lane. StormLib
+            // operations are serialized per archive, so a large neighbor tile on the primary store could
+            // otherwise block an unrelated client open.
+            wxl::host::mpq::MpqStore archiveStore;
+            if (!archiveStore.Mount(wxl::host::ClientRoot(), false)) return 0;
+            wxl::host::SetThreadArchiveStore(&archiveStore);
             for (;;)
             {
                 std::string name;
@@ -87,7 +100,7 @@ namespace wxl::host::warm
                 hprof::OpenTrace trace; // warm-path stats stay out of the live request profile
                 std::vector<uint8_t> bytes;
                 bool nativeHit = false;
-                wxl::host::produce::ProduceCandidate(name, name, bytes, trace, nativeHit);
+                wxl::host::produce::ProduceCandidate(name, name, bytes, trace, nativeHit, archiveStore);
             }
             return 0;
         }
@@ -112,6 +125,7 @@ namespace wxl::host::warm
 
     void StartTileWarmer()
     {
+        if (!TileWarmEnabled()) return;
         // Pre-produces the neighbors of each served map tile so flight streaming hits a warm transform
         // cache instead of paying a cold tile transform inside a live open.
         if (HANDLE tileWarmer = CreateThread(nullptr, 0, TileWarmer, nullptr, 0, nullptr))
@@ -120,6 +134,7 @@ namespace wxl::host::warm
 
     void QueueNeighborTiles(const std::string& servedName)
     {
+        if (!TileWarmEnabled()) return;
         std::string prefix;
         int x = 0, y = 0;
         if (!ParseTileName(wxl::host::produce::NameKey(servedName), prefix, x, y)) return;

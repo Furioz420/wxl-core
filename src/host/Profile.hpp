@@ -46,6 +46,7 @@ namespace wxl::host::profile
         uint32_t archiveReads = 0;
         uint32_t archiveMisses = 0;
         uint32_t nativeSkips = 0;
+        uint32_t standardElisions = 0;
         uint32_t transformCalls = 0;
         uint32_t transformClaims = 0;
         uint32_t servedCalls = 0;

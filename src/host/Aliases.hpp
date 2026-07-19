@@ -17,6 +17,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 // When a direct read of a client name misses, the same asset often lives under a sibling spelling: gender
@@ -25,6 +26,15 @@
 // to retry. Each derives purely from the name and appends only spellings distinct from it.
 namespace wxl::host::produce
 {
+    /**
+     * @brief Cheaply reports whether `name` can produce any alternate spellings.
+     *
+     * This is deliberately conservative: false guarantees BuildAliases would append nothing, while true
+     * may still produce an empty list after the detailed suffix checks. The serve path uses it to avoid
+     * building strings for the overwhelmingly common world/terrain names that never have aliases.
+     */
+    bool MayHaveAliases(std::string_view name);
+
     /**
      * @brief Appends every alternate spelling `name` may also be opened under, in retry priority order.
      * @param name     requested file name that missed a direct read
