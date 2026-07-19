@@ -48,6 +48,8 @@ namespace
         void* base = nullptr;      // non-null for standalone VirtualAlloc
         uint32_t arenaOffset = 0;  // valid when base == nullptr
         uint32_t arenaSize = 0;
+        uint32_t accountedSize = 0;
+        bool retiredStandalone = false;
     };
 
     struct M2ArenaRange
@@ -67,6 +69,42 @@ namespace
     uint32_t g_m2ArenaSize = 0;
     std::vector<M2ArenaRange> g_m2ArenaFree;
     std::atomic<uint32_t> g_duplicateM2ArenaFrees{ 0 };
+    std::atomic<uint32_t> g_duplicateM2StandaloneFrees{ 0 };
+    std::atomic<uint64_t> g_activeM2ArenaBytes{ 0 };
+    std::atomic<uint64_t> g_peakM2ArenaBytes{ 0 };
+    std::atomic<uint64_t> g_activeM2StandaloneBytes{ 0 };
+    std::atomic<uint64_t> g_peakM2StandaloneBytes{ 0 };
+
+    void AddActiveBytes(std::atomic<uint64_t>& active, std::atomic<uint64_t>& peak, uint32_t bytes)
+    {
+        const uint64_t current = active.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+        uint64_t observedPeak = peak.load(std::memory_order_relaxed);
+        while (current > observedPeak &&
+               !peak.compare_exchange_weak(observedPeak, current, std::memory_order_relaxed))
+        {
+        }
+    }
+
+    void RemoveActiveBytes(std::atomic<uint64_t>& active, uint32_t bytes)
+    {
+        active.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+
+    void* NativeM2BufferAlloc(uint32_t size, const char* tag, int line)
+    {
+        void* native = g_origM2BufferAlloc(size, tag, line);
+        if (native)
+        {
+            // VirtualFree makes a retired standalone address available to every allocator in the
+            // process, including Blizzard's heap. Do not mistake a reused native address for a
+            // duplicate standalone free once it has been handed back to the caller.
+            std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
+            const auto it = g_virtualM2Allocs.find(native);
+            if (it != g_virtualM2Allocs.end() && it->second.retiredStandalone)
+                g_virtualM2Allocs.erase(it);
+        }
+        return native;
+    }
 
     /** @brief Logs a coarse 32-bit address-space snapshot around very large model allocations. */
     void LogClientAddressSpace(const char* reason)
@@ -103,15 +141,23 @@ namespace
                 arenaLargest = std::max<uint64_t>(arenaLargest, range.size);
             }
         }
+        const uint64_t arenaActive = g_activeM2ArenaBytes.load(std::memory_order_relaxed);
+        const uint64_t arenaPeak = g_peakM2ArenaBytes.load(std::memory_order_relaxed);
+        const uint64_t standaloneActive = g_activeM2StandaloneBytes.load(std::memory_order_relaxed);
+        const uint64_t standalonePeak = g_peakM2StandaloneBytes.load(std::memory_order_relaxed);
         WLOG_INFO(
-            "client-memory: reason=%s commit_mb=%.1f reserve_mb=%.1f free_mb=%.1f largest_free_mb=%.1f arena_free_mb=%.1f arena_largest_mb=%.1f",
+            "client-memory: reason=%s commit_mb=%.1f reserve_mb=%.1f free_mb=%.1f largest_free_mb=%.1f arena_free_mb=%.1f arena_largest_mb=%.1f arena_active_bytes=%llu arena_peak_bytes=%llu standalone_active_bytes=%llu standalone_peak_bytes=%llu",
             reason ? reason : "unknown",
             static_cast<double>(committed) / (1024.0 * 1024.0),
             static_cast<double>(reserved) / (1024.0 * 1024.0),
             static_cast<double>(freeBytes) / (1024.0 * 1024.0),
             static_cast<double>(largestFree) / (1024.0 * 1024.0),
             static_cast<double>(arenaFree) / (1024.0 * 1024.0),
-            static_cast<double>(arenaLargest) / (1024.0 * 1024.0));
+            static_cast<double>(arenaLargest) / (1024.0 * 1024.0),
+            static_cast<unsigned long long>(arenaActive),
+            static_cast<unsigned long long>(arenaPeak),
+            static_cast<unsigned long long>(standaloneActive),
+            static_cast<unsigned long long>(standalonePeak));
     }
 
     bool LargeM2VirtualAllocEnabled()
@@ -248,6 +294,7 @@ namespace
     void* TryVirtualM2Alloc(uint32_t size)
     {
         const SIZE_T total = static_cast<SIZE_T>(size) + 0x20u;
+        const uint32_t accountedSize = AlignUpU32(size + 0x20u, 0x1000u);
         auto* base = static_cast<uint8_t*>(VirtualAlloc(nullptr, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (!base)
             return nullptr;
@@ -262,8 +309,30 @@ namespace
         }
         ptr[-1] = static_cast<uint8_t>(shift);
 
-        std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
-        g_virtualM2Allocs.emplace(ptr, VirtualM2Allocation{ base, 0, 0 });
+        bool tracked = false;
+        {
+            std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
+            auto it = g_virtualM2Allocs.find(ptr);
+            if (it == g_virtualM2Allocs.end())
+            {
+                tracked = g_virtualM2Allocs.emplace(
+                    ptr, VirtualM2Allocation{ base, 0, 0, accountedSize, false }).second;
+            }
+            else if (it->second.retiredStandalone)
+            {
+                // Windows reused a released VirtualAlloc address. Replacing the retired record
+                // clears its tombstone before this allocation becomes visible to the caller.
+                it->second = VirtualM2Allocation{ base, 0, 0, accountedSize, false };
+                tracked = true;
+            }
+            if (tracked)
+                AddActiveBytes(g_activeM2StandaloneBytes, g_peakM2StandaloneBytes, accountedSize);
+        }
+        if (!tracked)
+        {
+            VirtualFree(base, 0, MEM_RELEASE);
+            return nullptr;
+        }
         return ptr;
     }
 
@@ -275,14 +344,32 @@ namespace
         VirtualM2Allocation alloc{};
         bool ours = false;
         bool staleArenaPointer = false;
+        bool staleStandalonePointer = false;
         {
             std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
             auto it = g_virtualM2Allocs.find(ptr);
             if (it != g_virtualM2Allocs.end())
             {
-                alloc = it->second;
-                g_virtualM2Allocs.erase(it);
-                ours = true;
+                if (it->second.retiredStandalone)
+                {
+                    staleStandalonePointer = true;
+                }
+                else
+                {
+                    alloc = it->second;
+                    ours = true;
+                    if (alloc.base)
+                    {
+                        // Keep the existing map node as a tombstone. The free path therefore does
+                        // not need to allocate bookkeeping memory while the client may be under
+                        // severe address-space pressure.
+                        it->second = VirtualM2Allocation{ nullptr, 0, 0, 0, true };
+                    }
+                    else
+                    {
+                        g_virtualM2Allocs.erase(it);
+                    }
+                }
             }
 
             // Blizzard's heap can never own a pointer in this exclusively reserved arena. Shared
@@ -303,12 +390,30 @@ namespace
             VirtualFree(g_m2ArenaBase + alloc.arenaOffset, alloc.arenaSize, MEM_DECOMMIT);
             std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
             InsertArenaFreeRangeLocked(alloc.arenaOffset, alloc.arenaSize);
+            RemoveActiveBytes(g_activeM2ArenaBytes, alloc.accountedSize);
             return;
         }
 
         if (ours && alloc.base)
         {
-            VirtualFree(alloc.base, 0, MEM_RELEASE);
+            if (VirtualFree(alloc.base, 0, MEM_RELEASE))
+            {
+                RemoveActiveBytes(g_activeM2StandaloneBytes, alloc.accountedSize);
+            }
+            else
+            {
+                const DWORD error = GetLastError();
+                // The address was not actually retired. Restore ownership so a later legitimate
+                // free can retry, and do not decrement the active-byte counter.
+                {
+                    std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
+                    auto it = g_virtualM2Allocs.find(ptr);
+                    if (it != g_virtualM2Allocs.end() && it->second.retiredStandalone)
+                        it->second = alloc;
+                }
+                WLOG_WARN("m2-memory: VirtualFree failed for standalone buffer ptr=%p error=%lu",
+                          ptr, static_cast<unsigned long>(error));
+            }
             return;
         }
 
@@ -317,6 +422,16 @@ namespace
             const uint32_t count = g_duplicateM2ArenaFrees.fetch_add(1, std::memory_order_relaxed) + 1;
             if (count == 1 || (count & (count - 1)) == 0)
                 WLOG_WARN("m2-memory: ignored duplicate/stale arena free ptr=%p (count=%u)", ptr, count);
+            return;
+        }
+
+        if (staleStandalonePointer)
+        {
+            const uint32_t count =
+                g_duplicateM2StandaloneFrees.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 1 || (count & (count - 1)) == 0)
+                WLOG_WARN("m2-memory: ignored duplicate/stale standalone free ptr=%p (count=%u)",
+                          ptr, count);
             return;
         }
 
@@ -344,7 +459,9 @@ namespace
                     ptr[-1] = 0x10u;
                     {
                         std::lock_guard<std::mutex> lock(g_virtualM2AllocMutex);
-                        g_virtualM2Allocs.emplace(ptr, VirtualM2Allocation{ nullptr, offset, need });
+                        g_virtualM2Allocs.emplace(
+                            ptr, VirtualM2Allocation{ nullptr, offset, need, need, false });
+                        AddActiveBytes(g_activeM2ArenaBytes, g_peakM2ArenaBytes, need);
                     }
                     WLOG_DEBUG("m2-memory: arena buffer %u bytes (%s)", size, tag ? tag : "M2");
                     if (size >= 8u * 1024u * 1024u) LogClientAddressSpace("m2-arena");
@@ -364,7 +481,7 @@ namespace
             WLOG_WARN("m2-memory: VirtualAlloc failed for %u bytes, falling back to native allocator", size);
         }
 
-        return g_origM2BufferAlloc(size, tag, line);
+        return NativeM2BufferAlloc(size, tag, line);
     }
 
     /**
