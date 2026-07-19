@@ -18,10 +18,12 @@
 #include "engine/hook/Hook.hpp"
 #include "engine/hook/Registry.hpp"
 #include "engine/events/Event.hpp"
+#include "core/Logger.hpp"
 
 #include "offsets/game/M2.hpp"
 
 #include <cstdint>
+#include <intrin.h>
 
 namespace
 {
@@ -30,6 +32,7 @@ namespace
 
     m2::M2_SlotDispatchFn g_origSlotDispatch = nullptr;
     m2::M2_SlotClearFn    g_origSlotClear    = nullptr;
+    m2::CharacterRemoveVisualsFn g_origCharacterRemoveVisuals = nullptr;
 
     /**
      * @brief Detours the CharModel equip-slot handler, emitting OnItemSlotChange then calling the native.
@@ -69,12 +72,41 @@ namespace
         g_origSlotClear(cmo, edx, equipSlotWow);
     }
 
+    /** @brief Preserves the complete model tree cloned for CharacterModelFrame.
+     *
+     * CharacterModelFrame first duplicates the live unit's complete M2 tree, then calls the generic
+     * character cleanup routine. That routine knows only WotLK visual attachment IDs and strips the
+     * retail collection, race/gender cape, and modern helm children from the otherwise-correct clone.
+     * The call at 0x0059763D is unique to this private preview clone, so bypassing cleanup at its exact
+     * return address preserves those already-cloned children without refreshing the frame or creating
+     * any additional model instances. All Glue/world cleanup calls still run normally.
+     */
+    void __cdecl hkCharacterModelFrameRemoveVisuals(void* cloneRoot)
+    {
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        if (caller == m2::kCharacterModelFrameRemoveVisualsReturn && cloneRoot)
+        {
+            static bool logged = false;
+            if (!logged)
+            {
+                logged = true;
+                WLOG_INFO("charmodel-frame: preserving cloned visual tree clone=%p", cloneRoot);
+            }
+            return;
+        }
+
+        g_origCharacterRemoveVisuals(cloneRoot);
+    }
+
     bool InstallCharModel()
     {
         wxl::hook::Install("CharModelSlotDispatch", m2::kCharModelSlotDispatch,
                            &hkSlotDispatch, &g_origSlotDispatch);
         wxl::hook::Install("CharModelSlotClear", m2::kCharModelSlotClear,
                            &hkSlotClear, &g_origSlotClear);
+        wxl::hook::Install("CharacterModelFrameRemoveVisuals", m2::kCharacterRemoveVisuals,
+                           &hkCharacterModelFrameRemoveVisuals,
+                           &g_origCharacterRemoveVisuals);
         return true;
     }
 }

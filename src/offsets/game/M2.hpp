@@ -173,6 +173,10 @@ namespace wxl::offsets::game::m2
     // CharModel equip-slot clear (cmo, equipSlotWow): clears the WoW equipment slot on the CMO,
     // detaching any attached M2 and releasing its render context.
     constexpr uintptr_t kCharModelSlotClear    = 0x004EE6D0;
+    // Character visual cleanup. CharacterModelFrame calls it from 0x0059763D after duplicating the
+    // live unit tree; the other callers belong to world/Glue paths and must not trigger preview repair.
+    constexpr uintptr_t kCharacterRemoveVisuals = 0x004EAF70;
+    constexpr uintptr_t kCharacterModelFrameRemoveVisualsReturn = 0x00597642;
 
     // --- runtime instance object fields ---
     constexpr size_t kOffInstInitFlags      = 0x10;  // init flags (bit 0 = anim init done; bit 1 = geometry ready)
@@ -459,4 +463,7 @@ namespace wxl::offsets::game::m2
     using M2_SlotDispatchFn     = void (__fastcall*)(void* cmo, void* edx, uint32_t modelSlot, void* itemDataPtr, uint32_t postFlag);
     // SlotClear(cmo, edx, equipSlotWow): clears a WoW equipment slot on the CMO.
     using M2_SlotClearFn        = void (__fastcall*)(void* cmo, void* edx, uint32_t equipSlotWow);
+    // CCharacterComponent::RemoveVisuals(instance): one explicit stack argument; the caller cleans
+    // it (cdecl, BYTES_PURGED=0). It is not a thiscall despite operating on an M2 instance.
+    using CharacterRemoveVisualsFn = void (__cdecl*)(void* instance);
 }
