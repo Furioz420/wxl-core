@@ -20,6 +20,7 @@
 
 #include <windows.h>
 #include <algorithm>
+#include <atomic>
 #include <thread>
 
 using namespace wxl::ipc;
@@ -35,6 +36,7 @@ namespace
     uint32_t g_channelCount = 0;
     HANDLE   g_reqEv[kMaxChannels]  = {};
     HANDLE   g_respEv[kMaxChannels] = {};
+    std::atomic<uint32_t> g_responseSignalFailures{ 0 };
 
     /**
      * @brief Picks the channel count from the machine's hardware_concurrency, clamped to a sane range.
@@ -138,13 +140,18 @@ namespace wxl::host::ipc
      * @param i     channel index
      * @param seq   request sequence this response belongs to
      * @param resp  response payload bytes
-     * @return true if a nonzero-length response was written
+     * @return true when the matching response was published to the client-owned channel
      */
     bool PostResponse(uint32_t i, uint32_t seq, std::span<const uint8_t> resp)
     {
         if (i >= g_channelCount) return false;
 
         ControlHeader* hdr = ChannelHeader(g_base, i);
+        // A client must not normally reuse a timed-out channel until this worker completes. Still verify
+        // the captured request sequence defensively before touching the shared payload: this prevents an
+        // older/third-party client from letting a late worker overwrite a newer exchange on the channel.
+        if (hdr->reqSeq != seq) return false;
+
         uint8_t* payload = ChannelPayload(g_base, i);
         uint32_t n = static_cast<uint32_t>(resp.size());
         if (n > kChannelPayload) n = 0; // never overrun the window; signal a zero-length response
@@ -153,8 +160,28 @@ namespace wxl::host::ipc
         // Stamp the response with the sequence of the request it answers -- NOT the current reqSeq, which
         // the client may already have bumped for a newer request after timing this one out. This is what
         // lets the client reject a late response that belongs to an abandoned request.
+        // Check again after the potentially large copy. A sequence changed during the copy means the
+        // response was abandoned; do not publish or signal those bytes as a response to the new request.
+        if (hdr->reqSeq != seq)
+        {
+            hdr->respLen = 0;
+            return false;
+        }
+        MemoryBarrier();
         hdr->respSeq = seq;
-        SetEvent(g_respEv[i]);
-        return n != 0;
+        // Publication transfers any blob reference in the response to the client. If signaling fails,
+        // the client's quarantined-channel reaper can still observe the matching respSeq and close it;
+        // returning false here would make the host close the same reference a second time.
+        if (!SetEvent(g_respEv[i]))
+        {
+            const DWORD error = GetLastError();
+            const uint32_t failures =
+                g_responseSignalFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (failures == 1 || (failures & (failures - 1)) == 0)
+                WLOG_WARN("ipc: response seq=%u published but event signaling failed "
+                          "(win32=%lu count=%u)", seq,
+                          static_cast<unsigned long>(error), failures);
+        }
+        return true;
     }
 }

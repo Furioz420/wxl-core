@@ -309,6 +309,15 @@ namespace
     // --- channel pool: a free channel is acquired per request, then released ---
     std::atomic<bool> g_channelBusy[kMaxChannels] = {}; // false = free
 
+    // A request that has been signaled to the host must keep owning its channel after a timeout. The host
+    // worker may still be transforming the old request and can write its response much later; immediately
+    // reusing that payload window would let the late write corrupt an unrelated newer exchange. A nonzero
+    // sequence marks such a quarantined channel. AcquireChannel opportunistically reaps it only after the
+    // matching response is complete. The operation is retained so a late FileOpen blob can be closed rather
+    // than leaking its host-side reference after the original caller has already fallen back.
+    std::atomic<uint32_t> g_abandonedSeq[kMaxChannels] = {};
+    std::atomic<uint32_t> g_abandonedOp[kMaxChannels] = {};
+
     // Cold modern transforms can take several seconds before the host cache is warm. Timing out short here
     // makes the client fall back to native archives, which cannot see host-owned loose patch dirs -- so a
     // slow-but-valid open would silently lose its host version. Give the host generous time to answer.
@@ -406,9 +415,110 @@ namespace
     }
 
     /**
-     * @brief Acquires a free channel index, yielding while the pool is full.
+     * @brief Releases a channel back to the pool.
+     * @param i  channel index to free.
+     */
+    void ReleaseChannel(uint32_t i)
+    {
+        g_channelBusy[i].store(false, std::memory_order_release);
+    }
+
+    /** @brief Returns the next nonzero request sequence for one channel. */
+    uint32_t NextRequestSequence(ControlHeader* hdr)
+    {
+        uint32_t seq = hdr->reqSeq + 1;
+        if (seq == 0) seq = 1; // zero is reserved for "no abandoned request"
+        hdr->reqSeq = seq;
+        return seq;
+    }
+
+    /**
+     * @brief Keeps a sent-but-unanswered request's channel out of the free pool.
+     * @param i    channel index still owned by the abandoned request
+     * @param seq  request sequence whose eventual response retires the quarantine
+     * @param op   operation needed to clean up a late response
+     */
+    void QuarantineChannel(uint32_t i, uint32_t seq, ProfileOp op)
+    {
+        g_abandonedOp[i].store(static_cast<uint32_t>(op), std::memory_order_relaxed);
+        g_abandonedSeq[i].store(seq, std::memory_order_release);
+    }
+
+    /**
+     * @brief Reuses an already-quarantined channel to asynchronously close an abandoned FileOpen blob.
+     *
+     * The late response has completed, so no old worker can touch this channel again. The close request
+     * remains quarantined in turn and is reaped by a later AcquireChannel scan without blocking the caller.
+     * @return true when the close request was signaled to the host
+     */
+    bool BeginAbandonedBlobClose(uint32_t i, uint32_t blobId)
+    {
+        flexbuffers::Builder fbb;
+        fbb.Vector([&]() { fbb.UInt(OpFileClose); fbb.UInt(blobId); });
+        fbb.Finish();
+
+        const auto& req = fbb.GetBuffer();
+        auto* hdr = ChannelHeader(g_base, i);
+        uint8_t* payload = ChannelPayload(g_base, i);
+        ResetEvent(g_respEvent[i]); // consume/drop the late open's already-observed signal
+        memcpy(payload, req.data(), req.size());
+        hdr->reqLen = static_cast<uint32_t>(req.size());
+        const uint32_t seq = NextRequestSequence(hdr);
+        QuarantineChannel(i, seq, ProfileOp::Close);
+        if (SetEvent(g_reqEvent[i])) return true;
+
+        g_abandonedSeq[i].store(0, std::memory_order_release);
+        WLOG_WARN("ipc: could not signal cleanup for abandoned blob id=%u (win32=%lu)",
+                  blobId, GetLastError());
+        return false;
+    }
+
+    /**
+     * @brief Retires one quarantined channel whose matching late response has completed.
+     *
+     * For an abandoned large FileOpen, the response owns a host blob reference even though its original
+     * caller no longer receives the id. Convert the same channel directly into an asynchronous FileClose
+     * before making it available for unrelated traffic.
+     * @return true when the channel became free, false while it remains quarantined or owned
+     */
+    bool TryReapQuarantinedChannel(uint32_t i)
+    {
+        uint32_t seq = g_abandonedSeq[i].load(std::memory_order_acquire);
+        if (!seq) return false;
+
+        auto* hdr = ChannelHeader(g_base, i);
+        // The event is the normal cross-process publication barrier. Also accept a matching respSeq when
+        // SetEvent itself failed after the host published the response, otherwise that rare failure would
+        // strand the channel forever.
+        const DWORD signaled = WaitForSingleObject(g_respEvent[i], 0);
+        if (signaled != WAIT_OBJECT_0 && hdr->respSeq != seq) return false;
+        if (hdr->respSeq != seq) return false; // stale event from an older cycle
+        MemoryBarrier();
+
+        const ProfileOp op = static_cast<ProfileOp>(g_abandonedOp[i].load(std::memory_order_relaxed));
+        // Claim the completed quarantine so concurrent AcquireChannel callers cannot reap it twice.
+        if (!g_abandonedSeq[i].compare_exchange_strong(seq, 0,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            return false;
+
+        uint32_t blobId = 0;
+        if (op == ProfileOp::Open && hdr->respLen && hdr->respLen <= kChannelPayload)
+        {
+            const uint8_t* payload = ChannelPayload(g_base, i);
+            const auto vec = flexbuffers::GetRoot(payload, hdr->respLen).AsVector();
+            if (vec.size() >= 3 && vec[0].AsUInt32() == StOk)
+                blobId = vec[1].AsUInt32(); // zero means the response was inline
+        }
+
+        if (blobId && BeginAbandonedBlobClose(i, blobId)) return false;
+        ReleaseChannel(i);
+        return true;
+    }
+
+    /**
+     * @brief Acquires a free channel index, yielding while active requests own the pool.
      * @param profile  optional request-local profile sample.
-     * @return the acquired channel index.
+     * @return the acquired channel index, or kMaxChannels when every channel is quarantined
      */
     uint32_t AcquireChannel(ProfileSample* profile)
     {
@@ -417,8 +527,19 @@ namespace
         uint32_t spins = 0;
         for (;;)
         {
+            uint32_t quarantined = 0;
+            uint32_t active = 0;
             for (uint32_t i = 0; i < g_channelCount; ++i)
             {
+                if (g_abandonedSeq[i].load(std::memory_order_acquire))
+                {
+                    if (!TryReapQuarantinedChannel(i))
+                    {
+                        ++quarantined;
+                        continue;
+                    }
+                }
+
                 bool expected = false;
                 if (g_channelBusy[i].compare_exchange_strong(expected, true,
                         std::memory_order_acquire, std::memory_order_relaxed))
@@ -431,8 +552,23 @@ namespace
                     }
                     return i;
                 }
+                if (!g_abandonedSeq[i].load(std::memory_order_acquire)) ++active;
             }
+
             contended = true;
+            // Do not replace an infinite request timeout with an infinite queue wait. When every channel
+            // is awaiting a late host response, fail this transaction so the storage hook can fall back.
+            if (quarantined == g_channelCount && active == 0)
+            {
+                if (profile)
+                {
+                    profile->hasQueue = true;
+                    profile->queueTicks = QpcNow() - started;
+                    profile->queueContended = true;
+                }
+                return kMaxChannels;
+            }
+
             // A full pool means every channel is deep in an IPC round trip (ms scale): a few yields
             // catch the fast case, then sleep instead of burning a core spinning for milliseconds.
             if (++spins <= 16) SwitchToThread();
@@ -440,14 +576,12 @@ namespace
         }
     }
 
-    /**
-     * @brief Releases a channel back to the pool.
-     * @param i  channel index to free.
-     */
-    void ReleaseChannel(uint32_t i)
+    enum class SendResult : uint8_t
     {
-        g_channelBusy[i].store(false, std::memory_order_release);
-    }
+        Delivered,
+        NotSent,
+        Abandoned
+    };
 
     /**
      * @brief Runs one request on a channel: write payload, bump reqSeq, signal, wait for the matching response.
@@ -460,18 +594,19 @@ namespace
      * @param req     request payload.
      * @param seqOut  receives the sequence assigned to this request.
      * @param profile optional request-local profile sample.
-     * @return true when the response matching seqOut arrives before the timeout.
+     * @return Delivered for a matching response, NotSent for a local signaling failure, or Abandoned
+     *         when the host may still finish a request after this caller stops waiting
      */
-    bool SendOnChannel(uint32_t ch, const std::vector<uint8_t>& req, uint32_t& seqOut,
-                       ProfileSample* profile)
+    SendResult SendOnChannel(uint32_t ch, const std::vector<uint8_t>& req, uint32_t& seqOut,
+                             ProfileSample* profile)
     {
-        if (req.size() > kChannelPayload) return false;
+        if (req.size() > kChannelPayload) return SendResult::NotSent;
         auto* hdr = ChannelHeader(g_base, ch);
         uint8_t* payload = ChannelPayload(g_base, ch);
-        ResetEvent(g_respEvent[ch]); // drop any stale signal from a previous cycle on this channel
+        if (!ResetEvent(g_respEvent[ch])) return SendResult::NotSent;
         memcpy(payload, req.data(), req.size());
         hdr->reqLen = static_cast<uint32_t>(req.size());
-        seqOut = ++hdr->reqSeq;
+        seqOut = NextRequestSequence(hdr);
         const uint64_t waitStarted = profile ? QpcNow() : 0;
         const auto finishWait = [&](bool success) {
             if (profile)
@@ -482,7 +617,11 @@ namespace
             }
             return success;
         };
-        SetEvent(g_reqEvent[ch]);
+        if (!SetEvent(g_reqEvent[ch]))
+        {
+            finishWait(false);
+            return SendResult::NotSent;
+        }
 
         DWORD waited = 0;
         while (waited < kRequestTimeoutMs)
@@ -492,13 +631,22 @@ namespace
             DWORD slice = kRequestTimeoutMs - waited;
             if (slice > 5) slice = 5;
             DWORD rc = WaitForSingleObject(g_respEvent[ch], slice);
-            if (rc == WAIT_OBJECT_0 && hdr->respSeq == seqOut) return finishWait(true); // our response, matched
-            if (rc != WAIT_OBJECT_0 && rc != WAIT_TIMEOUT) return finishWait(false);    // event failure: give up
+            if (rc == WAIT_OBJECT_0 && hdr->respSeq == seqOut)
+            {
+                finishWait(true);
+                return SendResult::Delivered;
+            }
+            if (rc != WAIT_OBJECT_0 && rc != WAIT_TIMEOUT)
+            {
+                finishWait(false);
+                return SendResult::Abandoned; // request was signaled; the host may still complete it
+            }
             waited += slice; // timeout slice, or a stale mismatched signal: keep waiting for ours
         }
         if (++g_timeouts <= 20)
             WLOG_WARN("ipc: request seq=%u timed out after %u ms", seqOut, kRequestTimeoutMs);
-        return finishWait(false);
+        finishWait(false);
+        return SendResult::Abandoned;
     }
 
     /**
@@ -527,10 +675,15 @@ namespace
             return false;
         }
         uint32_t ch = AcquireChannel(profile);
+        if (ch >= g_channelCount)
+        {
+            if (profile) FinishProfileTransaction(*profile, QpcNow(), true);
+            return false;
+        }
         uint32_t reqSeq = 0;
-        bool ok = SendOnChannel(ch, req, reqSeq, profile);
+        const SendResult send = SendOnChannel(ch, req, reqSeq, profile);
         bool delivered = false;
-        if (ok)
+        if (send == SendResult::Delivered)
         {
             auto* hdr = ChannelHeader(g_base, ch);
             const uint8_t* payload = ChannelPayload(g_base, ch);
@@ -547,10 +700,11 @@ namespace
                 }
             }
         }
-        ReleaseChannel(ch);
+        if (send == SendResult::Abandoned) QuarantineChannel(ch, reqSeq, profileOp);
+        else                               ReleaseChannel(ch);
         // Host statuses (including StNotFound) are delivered operations. Only transport/envelope loss is tf.
-        if (profile) FinishProfileTransaction(*profile, QpcNow(), !ok || !delivered);
-        return ok;
+        if (profile) FinishProfileTransaction(*profile, QpcNow(), !delivered);
+        return delivered;
     }
 }
 

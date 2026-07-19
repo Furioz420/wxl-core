@@ -52,7 +52,7 @@ namespace wxl::host::ipc
      * @param i     channel index
      * @param seq   request sequence this response belongs to (echoed back so the client can match it)
      * @param resp  response payload bytes
-     * @return true if a nonzero-length response was written
+     * @return true when the matching response was published to the client-owned channel
      */
     bool PostResponse(uint32_t i, uint32_t seq, std::span<const uint8_t> resp);
 }
