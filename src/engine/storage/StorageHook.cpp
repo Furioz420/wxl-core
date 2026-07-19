@@ -25,6 +25,7 @@
 #include "offsets/engine/Io.hpp"
 
 #include <windows.h>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdint>
@@ -101,9 +102,9 @@ namespace
     io::MopaqOpenArchiveFn g_origMopaqOpenArchive = nullptr;
     io::InitializeWowConfigFn g_origInitializeWowConfig = nullptr;
 
-    uint32_t g_served = 0; // files served from the host
-    uint32_t g_missed = 0; // host connected but file not served (read natively)
-    uint32_t g_opens  = 0; // intercept attempts
+    std::atomic<uint32_t> g_served{0}; // files served from the host
+    std::atomic<uint32_t> g_missed{0}; // host connected but file not served (read natively)
+    std::atomic<uint32_t> g_opens{0};  // intercept attempts
 
     // Names the host explicitly reported absent. Re-opening one skips the IPC round-trip and goes straight
     // native. Only a CONFIRMED host miss is recorded here -- never a timeout/desync -- so a transient failure
@@ -568,10 +569,10 @@ namespace
         if (ok)
         {
             if (out) *out = f;
-            if (VerboseStorageLogs() && g_served < 60)
+            if (VerboseStorageLogs() && g_served.load(std::memory_order_relaxed) < 60)
                 WLOG_INFO("Storage: serve '%s' (%u B, %s) from host%s",
                           handleName.c_str(), r.size, mode, logSuffix ? logSuffix : "");
-            ++g_served;
+            g_served.fetch_add(1, std::memory_order_relaxed);
             return true;
         }
 
@@ -601,8 +602,10 @@ namespace
         const bool specificAnim = archive != nullptr && EndsWithCI(safeName, ".anim");
         if (archive != nullptr && !specificAnim) return false;
 
-        if ((++g_opens % 2000) == 0)
-            WLOG_INFO("Storage stats: opens=%u served=%u missed=%u", g_opens, g_served, g_missed);
+        const uint32_t opens = g_opens.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((opens % 2000) == 0)
+            WLOG_INFO("Storage stats: opens=%u served=%u missed=%u", opens,
+                g_served.load(std::memory_order_relaxed), g_missed.load(std::memory_order_relaxed));
 
         // Client-side virtual providers: checked before IPC to avoid a host round-trip.
         // A provider returns true and fills `provided` to claim the file.
@@ -610,17 +613,36 @@ namespace
             std::vector<uint8_t> provided;
             for (auto fn : ClientProvidersSnapshot())
             {
-                if (!fn(safeName.c_str(), provided)) continue;
+                bool claimed = false;
+                try
+                {
+                    claimed = fn(safeName.c_str(), provided);
+                }
+                catch (...)
+                {
+                    provided.clear();
+                    WLOG_WARN("Storage: client provider threw while handling '%s'; skipping",
+                              safeName.c_str());
+                    continue;
+                }
+                if (!claimed) continue;
                 auto* f = static_cast<HostFile*>(calloc(1, sizeof(HostFile)));
                 if (!f) break;
                 f->magic     = kHandleMagic;
                 f->size      = static_cast<uint32_t>(provided.size());
                 f->buffer    = static_cast<uint8_t*>(malloc(f->size ? f->size : 1));
                 f->fullName  = DupName(safeName.c_str());
+                if (!f->buffer || !f->fullName)
+                {
+                    free(f->buffer);
+                    free(f->fullName);
+                    free(f);
+                    break;
+                }
                 f->shortName = f->fullName;
-                if (f->buffer && f->size) memcpy(f->buffer, provided.data(), f->size);
+                if (f->size) memcpy(f->buffer, provided.data(), f->size);
                 if (out) *out = f;
-                ++g_served;
+                g_served.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
         }
@@ -645,14 +667,14 @@ namespace
             // goes straight native. Only a CONFIRMED miss is cached -- a timeout/desync (r.hostMiss == false)
             // falls back to native for this open alone and is retried next time, never poisoning the name.
             RememberMiss(std::move(key));
-            if (VerboseStorageLogs() && g_missed < 200)
+            if (VerboseStorageLogs() && g_missed.load(std::memory_order_relaxed) < 200)
             {
                 if (specificAnim)
                     WLOG_INFO("Storage: anim MISS '%s' (specific) -> native archive", safeName.c_str());
                 else
                     WLOG_INFO("Storage: MISS '%s' -> native archive", safeName.c_str());
             }
-            ++g_missed;
+            g_missed.fetch_add(1, std::memory_order_relaxed);
         }
         return false;
     }
