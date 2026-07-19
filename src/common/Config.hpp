@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 /**
@@ -28,7 +29,10 @@
 namespace wxl::config
 {
     /**
-     * @brief Interprets a raw string as a boolean: leading 0/n/N/f/F means false, anything else true.
+     * @brief Interprets a raw string as a boolean.
+     *
+     * Common forms are accepted case-insensitively (0/no/false/off and 1/yes/true/on). For backward
+     * compatibility, other values retain the historical leading 0/n/f=false, anything-else=true rule.
      * @param raw       value to interpret, may be null.
      * @param fallback  result when raw is null or empty.
      */
@@ -51,11 +55,12 @@ namespace wxl::config
     bool Env(const char* name, bool fallback);
 
     /**
-     * @brief Feature toggle: an env var and a .disable sentinel file, defaulting to ON.
+     * @brief Feature toggle: an environment/config value and a .disable sentinel, defaulting to ON.
      *
-     * Matches the historical semantics of every WarcraftXL_*.disable pair: an explicitly falsy
-     * env value disables; otherwise the presence of the sentinel file disables; otherwise on.
-     * @param envName      environment variable name (falsy value disables).
+     * Resolution follows the project-wide priority exactly: environment > WarcraftXL.cfg > sentinel
+     * > default. Consequently, any explicit truthy value enables the feature even when an old sentinel
+     * remains beside Wow.exe.
+     * @param envName      environment/config key.
      * @param disableFile  sentinel file name whose presence disables, may be null.
      * @return true when the feature is enabled.
      */

@@ -6,7 +6,7 @@
 #
 # Format: KEY=value, one per line. '#' or ';' starts a comment. Spaces are tolerated.
 # Priority: environment variable > this file > sentinel file (.disable) > default.
-# Booleans: 0/n/f = no, anything else = yes.
+# Booleans: 0/no/false/off = no; 1/yes/true/on = yes (case-insensitive).
 #
 # Every key below is shown COMMENTED with its default value:
 # uncomment a line to take control of that knob.
@@ -61,6 +61,18 @@
 # Modern-assets transform cache: total size and per-entry cap.
 #WXL_TRANSFORM_CACHE_MB=512
 #WXL_TRANSFORM_CACHE_ENTRY_MB=64
+# Independent StormLib reader lanes. Two avoids sharing one StormLib handle across all workers;
+# use 1 for minimum host memory/handles, or benchmark 3+ on other storage.
+#WXL_HOST_ARCHIVE_READERS=2
+# Re-opened served-asset cache: total size, per-entry cap, and idle TTL.
+#WXL_HOST_CACHE_MB=1024
+#WXL_HOST_CACHE_ENTRY_MB=8
+#WXL_HOST_CACHE_TTL_SEC=300
+# Dependency prefetch is opt-in. Setting the thread count alone also opts in.
+#WXL_HOST_PREFETCH=0
+#WXL_HOST_PREFETCH_THREADS=2
+# Neighboring terrain tiles are transformed in a below-normal-priority background worker.
+#WXL_HOST_TILE_WARM=1
 
 # ----------------------------------------------------------------------------- Profilers
 # Client: asset phases + frame-hitch histogram (h25/h50/h100).
