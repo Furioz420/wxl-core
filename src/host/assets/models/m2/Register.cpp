@@ -47,8 +47,8 @@ namespace
     namespace skel = wxl::modern::assets::m2::skel;
     namespace text = wxl::modern::assets::common::text;
 
-    // Module-owned archive mount for the .skel sibling read; see AdtHost.cpp for why this is thread_local
-    // (one StormLib handle per host worker thread) rather than a shared instance under a lock.
+    // Offline/fallback archive mount for .skel sibling reads. Normal host requests reuse the archive store
+    // already owned by the current worker thread instead of mounting another complete archive set here.
     thread_local wxl::host::mpq::MpqStore g_store;
     thread_local bool g_mounted = false;
     thread_local bool g_mountTried = false;
@@ -99,12 +99,14 @@ namespace
             // A split-skeleton source (bones/sequences/attachments moved out of the MD20 body) ships a
             // sibling .skel file next to the .m2; splice it back in before the downport runs so bones and
             // sequences reach it and the client's bone-budget split at skin finalize.
-            if (text::EndsWithCI(name, ".m2") && EnsureMounted())
+            if (text::EndsWithCI(name, ".m2"))
             {
                 std::string skelName(name.substr(0, name.size() - 3));
                 skelName += ".skel";
                 std::vector<uint8_t> skelBytes;
-                if (g_store.ReadAll(skelName, skelBytes))
+                const bool hasWorkerStore = wxl::host::HasThreadArchiveStore();
+                if (wxl::host::ReadThreadArchive(skelName, skelBytes)
+                    || (!hasWorkerStore && EnsureMounted() && g_store.ReadAll(skelName, skelBytes)))
                     skel::Merge(skelBytes, md20);
             }
 

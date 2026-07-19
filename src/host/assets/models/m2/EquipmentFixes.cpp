@@ -293,14 +293,19 @@ namespace wxl::modern::assets::m2::equipment
                     LoadHelmOffsetFile(root / "WXLHelmOffsets.csv");
                     LoadHelmOffsetFile(root / "DBFilesClient" / "WXLHelmOffsets.csv");
 
-                    wxl::host::mpq::MpqStore store;
-                    if (store.Mount(root.string()))
+                    std::vector<uint8_t> bytes;
+                    bool archiveRead = wxl::host::ReadThreadArchive(
+                        "DBFilesClient\\WXLHelmOffsets.csv", bytes);
+                    if (!wxl::host::HasThreadArchiveStore())
                     {
-                        std::vector<uint8_t> bytes;
-                        if (store.ReadAll("DBFilesClient\\WXLHelmOffsets.csv", bytes) && !bytes.empty())
-                            LoadHelmOffsetText("archives:DBFilesClient\\WXLHelmOffsets.csv",
-                                std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+                        // Offline tooling has no serve lane, so retain a one-off fallback mount there.
+                        wxl::host::mpq::MpqStore store;
+                        if (store.Mount(root.string(), false))
+                            archiveRead = store.ReadAll("DBFilesClient\\WXLHelmOffsets.csv", bytes);
                     }
+                    if (archiveRead && !bytes.empty())
+                        LoadHelmOffsetText("archives:DBFilesClient\\WXLHelmOffsets.csv",
+                            std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 
                     std::error_code ec;
                     for (const auto& entry : std::filesystem::directory_iterator(root / "Data", ec))
