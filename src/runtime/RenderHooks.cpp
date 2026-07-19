@@ -22,8 +22,10 @@
 #include "core/Logger.hpp"
 #include "engine/hook/Registry.hpp"
 #include "events/Event.hpp"
+#include "features/diag/AssetProfile.hpp"
 #include "game/gx/Gx.hpp"
 #include "gpu/Proxy.hpp"
+#include "offsets/engine/Frame.hpp"
 #include "offsets/engine/Gx.hpp"
 #include "offsets/game/M2.hpp"
 #include "structure/m2/M2Format.hpp"
@@ -39,8 +41,10 @@ namespace
 {
     namespace off   = wxl::offsets::engine::gx;
     namespace ev    = wxl::events;
+    namespace frame = wxl::offsets::engine::frame;
     namespace gx    = wxl::game::gx;
     namespace m2off = wxl::offsets::game::m2;
+    namespace aprof = wxl::runtime::assetprof;
 
     // The model currently drawing, captured between a batch-draw enter and its DrawIndexedPrimitive.
     void* g_curModel = nullptr;
@@ -237,6 +241,13 @@ namespace
      */
     long __stdcall hkPresent(void* dev, const void* src, const void* dst, void* wnd, const void* dirty)
     {
+        // Present is the one boundary that runs once per rendered frame in Glue and in-world. The
+        // former 0x0047DCA0 anchor is EventForceIdleProcessing and does not provide a frame tick.
+        ev::UpdateArgs update{ *reinterpret_cast<float*>(frame::kDeltaSeconds),
+                               *reinterpret_cast<uint32_t*>(frame::kFrameTimeMs) };
+        ev::Emit(ev::Event::OnUpdate, &update);
+        aprof::RecordFrame(update.dt);
+
         ev::FrameArgs a{ dev };
         ev::Emit(ev::Event::OnFrame, &a);
         // Arm the supersampling redirect for the next frame: the world renders before the world->UI

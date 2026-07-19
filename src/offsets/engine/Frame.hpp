@@ -1,4 +1,4 @@
-// Per-frame pump entry and the frame-timing globals it refreshes.
+// Frame-timing globals refreshed by the client once per rendered frame.
 // Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
@@ -18,15 +18,10 @@
 
 #include <cstdint>
 
-// INTERNAL to the core. The master per-frame pump and the timing globals it updates each frame.
+// INTERNAL to the core. Timing values sampled by the Present boundary for the OnUpdate event.
 namespace wxl::offsets::engine::frame
 {
-    // Master per-frame pump: runs once per frame in every state (menu, login, world), near the top of
-    // the frame before the world render and before EndScene. The natural OnUpdate anchor.
-    constexpr uintptr_t kFramePump = 0x0047DCA0;
-    using FramePumpFn = void(__cdecl*)();
-
-    // Frame timing the pump refreshes: delta time in seconds and the frame timestamp in milliseconds.
+    // Delta time in seconds and the frame timestamp in milliseconds.
     constexpr uintptr_t kDeltaSeconds = 0x00CD76A0; // float
     constexpr uintptr_t kFrameTimeMs  = 0x00CD76AC; // u32
 }

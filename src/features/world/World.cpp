@@ -18,12 +18,10 @@
 #include "engine/hook/Hook.hpp"
 #include "engine/hook/Registry.hpp"
 #include "engine/events/Event.hpp"
-#include "features/diag/AssetProfile.hpp"
 #include "features/luabindings/LuaBindings.hpp"
 
 #include "common/Log.hpp"
 #include "common/Mem.hpp"
-#include "offsets/engine/Frame.hpp"
 #include "offsets/game/ADT.hpp"
 #include "offsets/game/World.hpp"
 
@@ -33,12 +31,9 @@ namespace
 {
     namespace ev    = wxl::events;
     namespace wld   = wxl::offsets::game::world;
-    namespace frame = wxl::offsets::engine::frame;
     namespace adt   = wxl::offsets::game::adt;
-    namespace aprof = wxl::runtime::assetprof;
 
     wld::World_EnterFn g_origWorldEnter = nullptr;
-    frame::FramePumpFn g_origFramePump  = nullptr;
 
     /**
      * @brief Detours world enter, emitting OnWorldLeave before and OnWorldEnter after the transition.
@@ -60,22 +55,9 @@ namespace
         ev::Emit(ev::Event::OnWorldEnter, &enter);
     }
 
-    /**
-     * @brief Detours the master per-frame pump, emitting OnUpdate once per frame with the frame delta.
-     */
-    void __cdecl hkFramePump()
-    {
-        g_origFramePump();
-        ev::UpdateArgs a{ *reinterpret_cast<float*>(frame::kDeltaSeconds),
-                          *reinterpret_cast<uint32_t*>(frame::kFrameTimeMs) };
-        ev::Emit(ev::Event::OnUpdate, &a);
-        aprof::RecordFrame(a.dt);
-    }
-
     bool InstallWorld()
     {
         wxl::hook::Install("CWorldEnter", wld::kEnter, &hkWorldEnter, &g_origWorldEnter);
-        wxl::hook::Install("FramePump", frame::kFramePump, &hkFramePump, &g_origFramePump);
 
         // Liquid-row null guard: this one liquid consumer dereferences the LiquidType row flag without the
         // null check the others have, so an unknown liquid id (from any served source) faults. Skip the

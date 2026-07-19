@@ -22,7 +22,9 @@
 #include "engine/hook/Hook.hpp"
 #include "engine/hook/Registry.hpp"
 #include "engine/events/Event.hpp"
+#include "features/diag/AssetProfile.hpp"
 #include "game/gx/Gx.hpp"
+#include "offsets/engine/Frame.hpp"
 #include "offsets/engine/Gx.hpp"
 
 #include <windows.h>
@@ -35,8 +37,10 @@ namespace
 {
     namespace off = wxl::offsets::engine::gx;
     namespace ev  = wxl::events;
+    namespace frame = wxl::offsets::engine::frame;
     namespace gx  = wxl::game::gx;
     namespace rd  = wxl::features::render::detail;
+    namespace aprof = wxl::runtime::assetprof;
 
     using EndSceneFn = long (__stdcall*)(void*);
     using PresentFn  = long (__stdcall*)(void*, const void*, const void*, void*, const void*);
@@ -74,6 +78,13 @@ namespace
      */
     long __stdcall hkPresent(void* dev, const void* src, const void* dst, void* wnd, const void* dirty)
     {
+        // Present runs exactly once per rendered frame in both Glue and the world. Use it for the
+        // logic tick instead of EventForceIdleProcessing, which is not a frame pump.
+        ev::UpdateArgs update{ *reinterpret_cast<float*>(frame::kDeltaSeconds),
+                               *reinterpret_cast<uint32_t*>(frame::kFrameTimeMs) };
+        ev::Emit(ev::Event::OnUpdate, &update);
+        aprof::RecordFrame(update.dt);
+
         ev::FrameArgs a{ dev };
         ev::Emit(ev::Event::OnFrame, &a);
         return g_origPresent(dev, src, dst, wnd, dirty);
