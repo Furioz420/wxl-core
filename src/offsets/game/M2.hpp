@@ -47,6 +47,12 @@ namespace wxl::offsets::game::m2
     constexpr uintptr_t kVersionGateInit = 0x0083CF51; // version-too-high branch
     constexpr uintptr_t kVersionGateAnim = 0x0083C745; // anim-parse version branch
 
+    // CM2Scene broadphase: collects the M2 candidates whose bounds intersect the pick ray.
+    // The native is thiscall and returns the candidate count consumed by EndHitTest.
+    constexpr uintptr_t kSceneSphereTestModels = 0x0081CFF0;
+    using M2_SceneSphereTestModelsFn = int(__thiscall*)(
+        void* scene, float* rayOrigin, float* rayDirection, float rayLength, int alternatePass);
+
     constexpr uintptr_t kSceneTriangleHitTest = 0x0081D510;
     using M2_SceneTriangleHitTestFn = int(__fastcall*)(
         void* scratch, void* edx, uint16_t* indexBegin, uint16_t* indexEnd, int vertexBase,
@@ -169,7 +175,7 @@ namespace wxl::offsets::game::m2
     constexpr uintptr_t kCharModelSlotClear    = 0x004EE6D0;
 
     // --- runtime instance object fields ---
-    constexpr size_t kOffInstInitFlags      = 0x10;  // init flags (bit 0 = anim init done; bit 6 = char-select present)
+    constexpr size_t kOffInstInitFlags      = 0x10;  // init flags (bit 0 = anim init done; bit 1 = geometry ready)
     constexpr size_t kOffInstModel          = 0x2C;  // -> runtime model
     constexpr size_t kOffInstParent         = 0x48;  // -> parent M2 instance (null for root)
     constexpr size_t kOffInstBonePalette    = 0x98;  // -> bone matrices, row-major 4x4

@@ -32,12 +32,39 @@ namespace
     namespace ev = wxl::events;
     namespace m2 = wxl::offsets::game::m2;
 
+    m2::M2_SceneSphereTestModelsFn g_origSceneSphereTestModels = nullptr;
     m2::M2_SceneTriangleHitTestFn g_origSceneTriangleHitTest = nullptr;
     m2::M2_SortOpaqueGeoBatchesFn g_origSortOpaqueGeoBatches = nullptr;
     m2::M2_SetupBatchAlphaFn      g_origSetupAlpha           = nullptr;
     m2::M2_PerFrameUpdateFn       g_origM2PerFrame           = nullptr;
+    std::atomic<uint32_t>         g_sceneSphereTestFaults{ 0 };
     std::atomic<uint32_t>         g_sceneHitTestFaults{ 0 };
     std::atomic<uint32_t>         g_opaqueSortFaults{ 0 };
+
+    /**
+     * @brief Quarantines a stale model-bounds entry during CM2Scene's broadphase pick test.
+     *
+     * Returning zero means "no M2 candidates" for this pick. The native EndHitTest caller then
+     * performs its normal scene-flag cleanup, which would be skipped by guarding the outer function.
+     */
+    int __fastcall hkSceneSphereTestModels(
+        void* scene, void* /*edx*/, float* rayOrigin, float* rayDirection,
+        float rayLength, int alternatePass)
+    {
+        __try
+        {
+            return g_origSceneSphereTestModels(
+                scene, rayOrigin, rayDirection, rayLength, alternatePass);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            const uint32_t faults =
+                g_sceneSphereTestFaults.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (faults == 1 || (faults & (faults - 1)) == 0)
+                WLOG_WARN("M2 scene broadphase skipped stale model bounds (faults=%u)", faults);
+            return 0;
+        }
+    }
 
     /**
      * @brief Contains a stale M2 collision-buffer read after disconnect/reconnect world teardown.
@@ -210,6 +237,11 @@ namespace
 
     bool InstallM2CompatBatches()
     {
+        // The native broadphase is thiscall while its detour is fastcall+EDX, so use the raw
+        // install overload rather than the same-type template.
+        wxl::hook::Install("M2SceneSphereTestModels", m2::kSceneSphereTestModels,
+                           reinterpret_cast<void*>(&hkSceneSphereTestModels),
+                           reinterpret_cast<void**>(&g_origSceneSphereTestModels));
         // thiscall target hooked through a fastcall+edx trampoline: the detour type cannot match the
         // native typedef, so the untyped install primitive is required here.
         wxl::hook::Install("M2SceneTriangleHitTest", m2::kSceneTriangleHitTest,
