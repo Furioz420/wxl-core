@@ -74,6 +74,14 @@
 # Neighboring terrain tiles are transformed in a below-normal-priority background worker.
 #WXL_HOST_TILE_WARM=1
 
+# ----------------------------------------------------------------------------- Split terrain (Cata+)
+# Enable Legion-style MTXP/MHID height-based terrain texture blending.
+#WXL_ADT_HEIGHT_BLEND=1
+# Blend-edge sharpening strength (0 = unsharpened, default 2, range 0..16).
+#WXL_ADT_HEIGHT_SHARPNESS=2
+# Height texture channel: "a" for retail alpha or "r" for alpha-less DXT1 repacks.
+#WXL_ADT_HEIGHT_CHANNEL=a
+
 # ----------------------------------------------------------------------------- Profilers
 # Client: asset phases + frame-hitch histogram (h25/h50/h100).
 #WXL_CLIENT_ASSET_PROFILE=1

@@ -49,6 +49,13 @@ namespace wxl::offsets::engine::lua
     constexpr uintptr_t kFrameScriptExecute = 0x00819210;
     using FrameScriptExecuteFn = void(__cdecl*)(const char* source, void* state);
 
+    // Registers a real engine CVar. The final flag archives the value to Config.wtf; this is the
+    // same call shape used by FrameXML's glue-only RegisterCVar implementation.
+    constexpr uintptr_t kCVarRegister = 0x00767FC0;
+    using CVarRegisterFn = void*(__cdecl*)(const char* name, const char* description,
+        uint32_t flags, const char* defaultValue, void* callback, uint32_t category,
+        int codeRegistered, uint32_t userData, int archive);
+
     // Verifies that an indirect callback lies in Wow.exe's .text section before Lua invokes it.
     constexpr uintptr_t kValidateFunctionPointer = 0x0086B5A0;
     using ValidateFunctionPointerFn = void(__cdecl*)(uintptr_t function);

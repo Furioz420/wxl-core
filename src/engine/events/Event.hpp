@@ -46,6 +46,7 @@ namespace wxl::events
         OnInput,         // window input message (swallowable)         (InputArgs)
         OnWorldClick,    // a world click resolved to a point/object   (WorldClickArgs)
         OnAdtChunkBuild, // an ADT map chunk is being built            (AdtChunkArgs)
+        OnAdtSplitTileLoad, // a split (Cata+) ADT tile finished its 3-file load (AdtSplitTileLoadArgs)
         OnWmoRootLoad,   // a WMO root buffer is read, before the walk (WmoRootLoadArgs)
         OnWmoGroupLoad,  // a WMO group buffer is read, before the walk(WmoGroupLoadArgs)
         OnTextureUpload, // a texture is about to upload to the device (TextureUploadArgs)
@@ -62,6 +63,7 @@ namespace wxl::events
         OnBeforeHostLaunch, // the DLL is about to launch the asset host (HostLaunchArgs)
         OnUiDraw,        // wxl.ui immediate-mode draw slot, between NewFrame and Render (UiDrawArgs)
         OnGrassWind,     // grass wind integrator advanced this frame (GrassWindArgs)
+        OnAdtHeightBlend,// a terrain PS permutation was patched for height blending (AdtHeightBlendArgs)
         Count
     };
 
@@ -151,6 +153,22 @@ namespace wxl::events
     /** @brief Args for OnAdtChunkBuild. */
     struct AdtChunkArgs      { void* chunk; uint32_t layerCount; };
     /**
+     * @brief Args for OnAdtSplitTileLoad, fired on the main thread after a split (Cata+) ADT tile's
+     *        root/_tex0/_obj0 trio finished loading and the stock tile parser ran over the direct-fill
+     *        state. tileFirst/tileSecond are the two %d of the "<Map>_%d_%d.adt" name; sizes are the
+     *        resident raw file buffer sizes (0 when that split file was absent); chunkCount is the
+     *        number of MCNKs indexed from the root (256 on a well-formed tile). Read-only.
+     */
+    struct AdtSplitTileLoadArgs
+    {
+        int      tileFirst;
+        int      tileSecond;
+        uint32_t rootSize;
+        uint32_t texSize;
+        uint32_t objSize;
+        uint32_t chunkCount;
+    };
+    /**
      * @brief Args for OnWmoRootLoad, fired after the WMO root buffer is read and before the native chunk
      *        walk; the window to reshape the root in place (read/replace the buffer via wxl::game::wmo).
      */
@@ -228,6 +246,13 @@ namespace wxl::events
      *        in radians. Read-only observation; runtime tuning goes through wxl.wind.* (methods).
      */
     struct GrassWindArgs     { float dirX; float dirY; float strength; float phase; };
+    /**
+     * @brief Args for OnAdtHeightBlend, fired on the draw thread the first time a stock terrain
+     *        pixel-shader permutation is patched with the height-blend formula (once per stock
+     *        permutation per session). layerCount is the permutation's texture layer count (2..4);
+     *        stockBytes/patchedBytes are the bytecode sizes before/after the injection. Read-only.
+     */
+    struct AdtHeightBlendArgs { uint32_t layerCount; uint32_t stockBytes; uint32_t patchedBytes; };
 
     using Handler = void (*)(void* user, const void* args);
 

@@ -15,7 +15,7 @@ namespace wxl::runtime::lua
     /** Adds Lua source executed once whenever WoW creates a new FrameScript state. */
     bool RegisterScript(const char* name, const char* source);
 
-    /** Adds a custom client CVar through WoW's native RegisterCVar Lua API on each new state. */
+    /** Adds a real archived client CVar through WoW's native CVar registry. */
     bool RegisterCVar(const char* name, const char* defaultValue);
 
     // ABI-safe wrappers exposed to external WXL modules.

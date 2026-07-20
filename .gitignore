@@ -69,8 +69,11 @@ Testing/
 .cache/
 
 # internal
-docs/
 tools/
+/repos/
+/docs/codex-session-backups/
+/WXL.rar
+/*.blp
 
 # Private extension-signing material must never enter version control.
 /wxl-signing-key.bin

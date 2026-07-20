@@ -49,6 +49,7 @@ namespace wxl::runtime::lua
         {
             std::string name;
             std::string defaultValue;
+            bool installed = false;
         };
 
         // Modules may register from global constructors or worker threads while the main thread
@@ -88,6 +89,19 @@ namespace wxl::runtime::lua
             if (existing != entries.end()) return existing->function == function;
             entries.push_back(FunctionEntry{name, function});
             return true;
+        }
+
+        void* RegisterNativeCVar(const char* name, const char* defaultValue)
+        {
+            __try
+            {
+                return wxl::game::Native<loff::CVarRegisterFn>(loff::kCVarRegister)(
+                    name, nullptr, 0, defaultValue, nullptr, 4, 1, 0, 1);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return nullptr;
+            }
         }
 
         /** Lua: x, y, z, guidLow, guidHigh = GetMouseWorldPosition(). */
@@ -227,23 +241,6 @@ namespace wxl::runtime::lua
             AddFunction("ConvertCoordsToScreenSpace", &ConvertCoordsToScreenSpace);
         }
 
-        std::string QuoteLua(const std::string& value)
-        {
-            std::string out;
-            out.reserve(value.size() + 2);
-            out.push_back('"');
-            for (const unsigned char ch : value)
-            {
-                if (ch == '\\' || ch == '"') { out.push_back('\\'); out.push_back(static_cast<char>(ch)); }
-                else if (ch == '\n') out += "\\n";
-                else if (ch == '\r') out += "\\r";
-                else if (ch == '\0') out += "\\000";
-                else out.push_back(static_cast<char>(ch));
-            }
-            out.push_back('"');
-            return out;
-        }
-
         void Execute(void* state, const std::string& source, const char* label)
         {
             if (!state || source.empty()) return;
@@ -303,8 +300,8 @@ namespace wxl::runtime::lua
             return _stricmp(entry.name.c_str(), name) == 0;
         });
         if (existing != entries.end()) return existing->defaultValue == defaultValue;
-        entries.push_back(CVarEntry{name, defaultValue});
-        return true;
+            entries.push_back(CVarEntry{name, defaultValue, false});
+            return true;
     }
 
     int __cdecl GetTop(void* state)
@@ -414,15 +411,21 @@ namespace wxl::runtime::lua
         {
             for (const CVarEntry& entry : cvars)
             {
-                // GlueXML uses a separate restricted Lua environment and does not publish the
-                // in-world RegisterCVar global. Skip it there; a new FrameScript state is detected
-                // on world entry and receives the same registration list automatically.
-                std::string source = "if type(RegisterCVar)=='function' then RegisterCVar(";
-                source += QuoteLua(entry.name);
-                source += ",";
-                source += QuoteLua(entry.defaultValue);
-                source += ") end";
-                Execute(state, source, entry.name.c_str());
+                if (entry.installed) continue;
+                void* cvar = RegisterNativeCVar(entry.name.c_str(), entry.defaultValue.c_str());
+                if (!cvar)
+                {
+                    WLOG_ERROR("lua: native CVar registration failed name='%s'", entry.name.c_str());
+                    continue;
+                }
+
+                std::lock_guard<std::mutex> lock(RegistryMutex());
+                for (CVarEntry& registered : CVars())
+                    if (_stricmp(registered.name.c_str(), entry.name.c_str()) == 0)
+                    {
+                        registered.installed = true;
+                        break;
+                    }
             }
             for (const ScriptEntry& entry : scripts)
                 Execute(state, entry.source, entry.name.c_str());
