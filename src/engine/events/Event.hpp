@@ -58,6 +58,8 @@ namespace wxl::events
         OnDoodadSpawn,   // a placed map doodad (CMapDoodad) was built (DoodadSpawnArgs)
         OnItemSlotChange,// a character model slot received an item    (ItemSlotChangeArgs)
         OnItemSlotClear, // a character model equipment slot was cleared(ItemSlotClearArgs)
+        OnWeaponVisualChange, // a unit's mainhand/offhand/ranged visible-item entry field was written
+                              // (WeaponVisualChangeArgs)
         OnWorldEnter,    // the world/map finished loading, in-world   (WorldEnterArgs)
         OnWorldLeave,    // the world/map is being torn down           (WorldLeaveArgs)
         OnBeforeHostLaunch, // the DLL is about to launch the asset host (HostLaunchArgs)
@@ -215,6 +217,14 @@ namespace wxl::events
     /** @brief Args for OnItemSlotClear; charModelObj is the CharModelObject, equipSlotWow is the
      *         WoW equipment slot index (EQUIPMENT_SLOT_* constants, 0-18). */
     struct ItemSlotClearArgs  { void* charModelObj; uint32_t equipSlotWow; };
+    /**
+     * @brief Args for OnWeaponVisualChange. Fires for every object in range whose visible-item entry
+     *        field is written, including the initial full sync when a unit enters view. This is the
+     *        point where the client learns the value, not only a semantic equip-change notification.
+     *        unit is the owning object pointer. slot is 0 = mainhand, 1 = offhand, 2 = ranged.
+     *        itemEntry is the new item entry ID (0 = slot cleared).
+     */
+    struct WeaponVisualChangeArgs { void* unit; uint32_t slot; uint32_t itemEntry; };
     /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the
      *         scene graph is updating — fires once per visible M2 instance per frame. */
     struct M2PerFrameUpdateArgs { void* renderCtx; };

@@ -17,6 +17,7 @@
 #include "Blobs.hpp"
 
 #include "ipc/Protocol.hpp"
+#include "ipc/ShmServer.hpp"
 
 #include <windows.h>
 #include <cstring>
@@ -77,7 +78,7 @@ namespace wxl::host::blobs
         // The section create/map and the (multi-MB) copy run outside the lock: this is the hottest
         // large-file path and every open/read/close otherwise serializes behind the copy.
         char nm[64];
-        BlobName(nm, sizeof(nm), id);
+        BlobName(nm, sizeof(nm), wxl::host::ipc::SessionPid(), id);
         HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, size ? size : 1, nm);
         if (!h) return 0;
         void* v = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, size);

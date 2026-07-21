@@ -21,6 +21,7 @@
 #include "core/Logger.hpp"
 
 #include "offsets/game/M2.hpp"
+#include "offsets/game/Unit.hpp"
 
 #include <cstdint>
 #include <intrin.h>
@@ -29,10 +30,12 @@ namespace
 {
     namespace ev = wxl::events;
     namespace m2 = wxl::offsets::game::m2;
+    namespace unit = wxl::offsets::game::unit;
 
     m2::M2_SlotDispatchFn g_origSlotDispatch = nullptr;
     m2::M2_SlotClearFn    g_origSlotClear    = nullptr;
     m2::CharacterRemoveVisualsFn g_origCharacterRemoveVisuals = nullptr;
+    unit::UnitFieldSetWriteFn g_origUnitFieldSetWrite = nullptr;
 
     /**
      * @brief Detours the CharModel equip-slot handler, emitting OnItemSlotChange then calling the native.
@@ -98,6 +101,52 @@ namespace
         g_origCharacterRemoveVisuals(cloneRoot);
     }
 
+    /** @brief Maps a visible-item update-field index to 0=mainhand, 1=offhand, 2=ranged. */
+    bool ResolveWeaponVisualSlot(uint32_t fieldIndex, uint32_t& slotOut)
+    {
+        switch (fieldIndex)
+        {
+        case unit::kFieldVisibleItemMainhandEntry: slotOut = 0; return true;
+        case unit::kFieldVisibleItemOffhandEntry:  slotOut = 1; return true;
+        case unit::kFieldVisibleItemRangedEntry:   slotOut = 2; return true;
+        default: return false;
+        }
+    }
+
+    /** @brief C++ side of the raw update-field capture. */
+    void __cdecl OnUnitFieldSetCaptured(uint32_t fieldArrayBase, uint32_t fieldIndex, uint32_t value)
+    {
+        uint32_t slot = 0;
+        if (!ResolveWeaponVisualSlot(fieldIndex, slot)) return;
+
+        void* unitPtr = reinterpret_cast<uint8_t*>(fieldArrayBase) - unit::kUnitFieldArrayOffset;
+        ev::WeaponVisualChangeArgs a{ unitPtr, slot, value };
+        ev::Emit(ev::Event::OnWeaponVisualChange, &a);
+    }
+
+    /**
+     * @brief Captures eax/ecx/edx at the raw update-field write and resumes through its trampoline.
+     *
+     * Every register and flag is restored before the displaced instruction runs, so the intercepted
+     * update and its caller observe the original machine state.
+     */
+    __declspec(naked) void hkUnitFieldSetWrite()
+    {
+        __asm
+        {
+            pushfd
+            pushad
+            push ecx
+            push edx
+            push eax
+            call OnUnitFieldSetCaptured
+            add esp, 12
+            popad
+            popfd
+            jmp g_origUnitFieldSetWrite
+        }
+    }
+
     bool InstallCharModel()
     {
         wxl::hook::Install("CharModelSlotDispatch", m2::kCharModelSlotDispatch,
@@ -107,6 +156,11 @@ namespace
         wxl::hook::Install("CharacterModelFrameRemoveVisuals", m2::kCharacterRemoveVisuals,
                            &hkCharacterModelFrameRemoveVisuals,
                            &g_origCharacterRemoveVisuals);
+        // This is an instruction hook rather than a function boundary, so the untyped overload is
+        // deliberate: the naked stub captures live registers and the trampoline resumes the epilogue.
+        wxl::hook::Install("UnitFieldSetWrite", unit::kUnitFieldSetWrite,
+                           reinterpret_cast<void*>(&hkUnitFieldSetWrite),
+                           reinterpret_cast<void**>(&g_origUnitFieldSetWrite));
         return true;
     }
 }

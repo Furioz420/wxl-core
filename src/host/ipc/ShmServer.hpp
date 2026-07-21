@@ -31,10 +31,13 @@ namespace wxl::host::ipc
      *        the machine's hardware_concurrency (clamped to [kMinChannels, kMaxChannels]).
      * @return true on success
      */
-    bool Create();
+    bool Create(uint32_t sessionPid);
 
     /** @brief Returns the channel count chosen by Create() (0 before it succeeds). */
     uint32_t ChannelCount();
+
+    /** @brief Returns the client PID that owns the current IPC namespace (0 before Create succeeds). */
+    uint32_t SessionPid();
 
     /**
      * @brief Blocks until any channel has a request; a pool of worker threads (fewer than the channel

@@ -57,7 +57,7 @@ namespace wxl::host::serve
          * half the inflight opens queued behind the other half while the render thread waited on one of
          * them. channels-1 keeps one logical core of headroom for the game client; most request time is
          * I/O wait anyway, not CPU. WXL_HOST_WORKERS overrides for low-core machines or experiments.
-         * @param channelCount  channel count chosen by wxl::host::ipc::Create()
+         * @param channelCount  channel count chosen by wxl::host::ipc::Create(sessionPid)
          * @return worker thread count, at least 1, at most channelCount
          */
         uint32_t ComputeWorkerCount(uint32_t channelCount)
@@ -282,11 +282,15 @@ namespace wxl::host::serve
 
     int Run(const std::string& clientRoot, uint32_t clientPid)
     {
-        // One host per session.
-        HANDLE singleton = CreateMutexA(nullptr, FALSE, "Local\\WarcraftXLHostSingleton");
+        // One host per client process. Manual launches without --client-pid use the host's own PID,
+        // which still gives them an isolated namespace instead of colliding with a live client.
+        const uint32_t sessionPid = clientPid ? clientPid : GetCurrentProcessId();
+        char singletonName[64];
+        HostSingletonName(singletonName, sizeof(singletonName), sessionPid);
+        HANDLE singleton = CreateMutexA(nullptr, FALSE, singletonName);
         if (singleton && GetLastError() == ERROR_ALREADY_EXISTS)
         {
-            WLOG_INFO("host: another instance is running, exiting");
+            WLOG_INFO("host: another instance is running for session %u, exiting", sessionPid);
             return 0;
         }
 
@@ -340,7 +344,7 @@ namespace wxl::host::serve
         warm::StartResolverWarmer();
         warm::StartTileWarmer();
 
-        if (!wxl::host::ipc::Create())
+        if (!wxl::host::ipc::Create(sessionPid))
         {
             WLOG_INFO("host: ShmServer.Create failed (err %lu)", GetLastError());
             return 1;

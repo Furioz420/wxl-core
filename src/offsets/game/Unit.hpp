@@ -57,6 +57,23 @@ namespace wxl::offsets::game::unit
     constexpr size_t kModelParentField  = 0x48;  // model -> parent model (0 = root)
     constexpr size_t kUnitPositionField = 0x798; // unit object -> world position (3 floats x, y, z)
 
+    // --- update-field commit (RE'd via live write-breakpoint tracing) ---
+    // `mov dword ptr [eax+edx*4], ecx` commits one uint32 update field into an object's field array.
+    // eax = field array base, edx = field index, ecx = new value. This is a raw instruction address,
+    // not a function boundary. It is safe to detour because it sits immediately before the containing
+    // function's epilogue and no control flow branches into the overwritten bytes. The hook therefore
+    // uses a naked register-capture stub instead of the typed function-detour path.
+    constexpr uintptr_t kUnitFieldSetWrite = 0x00743BAC;
+    using UnitFieldSetWriteFn = void(__cdecl*)();
+
+    // Visible-item entry update-field indices for the three weapon categories.
+    constexpr uint32_t kFieldVisibleItemMainhandEntry = 0x139;
+    constexpr uint32_t kFieldVisibleItemOffhandEntry  = 0x13B;
+    constexpr uint32_t kFieldVisibleItemRangedEntry   = 0x13D;
+
+    // eax at kUnitFieldSetWrite equals object pointer + this offset.
+    constexpr size_t kUnitFieldArrayOffset = 0x1958;
+
     // --- type masks ---
     constexpr uint32_t kTypeMaskUnit   = 0x08;
     constexpr uint32_t kTypeMaskPlayer = 0x10;
