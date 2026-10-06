@@ -91,9 +91,22 @@ namespace wxl::offsets::engine::lua
     // the top it was entered with on every path, so a chunk that fails to compile or raises is
     // reported through the client's script error path and nothing reaches the caller.
     constexpr uintptr_t kFrameScriptExecute = 0x00819210;
-    using FrameScriptExecuteFn = void(__cdecl*)(const char* source, const char* chunkName,
-                                                void* taintSource);
+    // Loads and runs a chunk. The state is NOT a parameter: the entry takes it from the engine's own
+    // global. chunkName is what the chunk is called in an error message; taintName is the owner
+    // recorded for the duration of the call, which is what makes a chunk run trusted or not.
+    using FrameScriptExecuteFn = void(__cdecl*)(
+        const char* source, const char* chunkName, const char* taintName);
 
+    // Registers a console variable, or re-registers an existing one with a new default.
+    constexpr uintptr_t kCVarRegister = 0x00767FC0;
+    // codeRegistered separates a variable declared by code from one restored out of the saved
+    // configuration; archive is what puts it back in that file when the client exits.
+    using CVarRegisterFn = void*(__cdecl*)(const char* name, const char* description,
+        uint32_t flags, const char* defaultValue, void* callback, uint32_t category,
+        int codeRegistered, uint32_t userData, int archive);
+
+    /// Console category a variable registered by us is filed under.
+    constexpr uint32_t kCVarCategoryDefault = 4;
     // --- stack and table primitives ---
     // The pseudo-indices, as every call site in the binary spells them: LUA_REGISTRYINDEX is the
     // literal 0xFFFFD8F0 and LUA_GLOBALSINDEX the literal 0xFFFFD8EE, both visible in

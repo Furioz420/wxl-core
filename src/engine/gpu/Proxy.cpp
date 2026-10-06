@@ -1,4 +1,4 @@
-// The d3d9.dll proxy: pass Direct3DCreate9(Ex) through to the system d3d9 and load WarcraftXL.dll.
+// The d3d9.dll proxy: forward Direct3DCreate9(Ex) to the selected backend and load WarcraftXL.dll.
 // Copyright (C) 2026 WarcraftXL
 //
 // This program is free software: you can redistribute it and/or modify
@@ -16,7 +16,7 @@
 
 // The client LoadLibrary's "d3d9.dll" from its own folder first, so this proxy loads ahead of the system
 // one. It does exactly two things: forward the factory-create exports to the real system d3d9, and load
-// WarcraftXL.dll into the process. All rendering runs on the client's native D3D9 device.
+// WarcraftXL.dll into the process. The optional DXVK backend implements the same D3D9 interface.
 
 #include <windows.h>
 #include <d3d9.h>
@@ -24,11 +24,13 @@
 #include "common/Log.hpp"
 
 #include <cstdarg>
+#include <cwchar>
 
 namespace
 {
     using Create9Fn   = IDirect3D9* (WINAPI*)(UINT);
     using Create9ExFn = HRESULT     (WINAPI*)(UINT, IDirect3D9Ex**);
+    HMODULE g_proxyModule = nullptr;
     Create9Fn   g_realCreate9   = nullptr;
     Create9ExFn g_realCreate9Ex = nullptr;
 
@@ -51,7 +53,7 @@ namespace
     }
 
     /**
-     * @brief Loads the real d3d9 from the system directory, falling back to a local d3d9_real.dll.
+     * @brief Loads an explicitly enabled local DXVK backend, otherwise system D3D9 with legacy fallback.
      *
      * A loaded module is keyed by full path, so the system d3d9.dll is a distinct module from this proxy
      * despite the shared base name.
@@ -59,12 +61,44 @@ namespace
      */
     HMODULE LoadRealD3D9()
     {
+        wchar_t overrideValue[16]{};
+        const bool forceSystem = GetEnvironmentVariableW(L"WXL_D3D9_BACKEND", overrideValue, 16) == 6 &&
+            _wcsicmp(overrideValue, L"system") == 0;
+        if (forceSystem) Log("d3d9proxy: session override selects system D3D9");
+        // Opt-in backend, anchored to this proxy's directory rather than the process CWD.
+        // Keep the system backend as the default and fall back if loading/exports fail.
+        wchar_t local[MAX_PATH];
+        DWORD length = GetModuleFileNameW(g_proxyModule, local, MAX_PATH);
+        if (!forceSystem && length && length < MAX_PATH) {
+            wchar_t* slash = wcsrchr(local, L'\\');
+            if (slash && (slash - local) + 64 < MAX_PATH) {
+                ++slash;
+                wcscpy_s(slash, MAX_PATH - (slash - local), L"WarcraftXL_dxvk.enable");
+                const DWORD attributes = GetFileAttributesW(local);
+                if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    wcscpy_s(slash, MAX_PATH - (slash - local), L"WXLRenderer\\dxvk\\d3d9.dll");
+                    if (HMODULE backend = LoadLibraryW(local)) {
+                        if (GetProcAddress(backend, "Direct3DCreate9") && GetProcAddress(backend, "Direct3DCreate9Ex")) {
+                            Log("d3d9proxy: selected optional DXVK backend: %ls", local);
+                            return backend;
+                        }
+                        Log("d3d9proxy: optional DXVK backend has missing exports; using system D3D9");
+                        FreeLibrary(backend);
+                    } else {
+                        Log("d3d9proxy: optional DXVK load failed (%lu); using system D3D9", GetLastError());
+                    }
+                }
+            }
+        }
         char path[MAX_PATH];
         UINT n = GetSystemDirectoryA(path, MAX_PATH);
         if (n != 0 && n < MAX_PATH - 16)
         {
             lstrcatA(path, "\\d3d9.dll");
-            if (HMODULE r = LoadLibraryA(path)) return r;
+            if (HMODULE r = LoadLibraryA(path)) {
+                Log("d3d9proxy: selected system backend: %s", path);
+                return r;
+            }
         }
         return LoadLibraryA("d3d9_real.dll");
     }
@@ -77,7 +111,7 @@ namespace
         if (!r) { Log("d3d9proxy: FAILED to load the system d3d9.dll"); return; }
         g_realCreate9   = reinterpret_cast<Create9Fn>(GetProcAddress(r, "Direct3DCreate9"));
         g_realCreate9Ex = reinterpret_cast<Create9ExFn>(GetProcAddress(r, "Direct3DCreate9Ex"));
-        Log("d3d9proxy: system d3d9 loaded (9=%p Ex=%p)", g_realCreate9, g_realCreate9Ex);
+        Log("d3d9proxy: backend loaded (9=%p Ex=%p)", g_realCreate9, g_realCreate9Ex);
     }
 
     /**
@@ -125,15 +159,15 @@ extern "C" HRESULT WINAPI Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out)
 }
 
 /**
- * @brief Process-attach entry point. Intentionally does no work.
+ * @brief Records the proxy module handle on process attach; performs no loading under the loader lock.
  *
  * Loading the real d3d9 and WarcraftXL.dll happens lazily in Direct3DCreate9(Ex): a LoadLibrary issued
  * here would run under the loader lock and can deadlock against the loaded DLL's attach.
  * @param reason  DLL notification reason.
  * @return TRUE.
  */
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {
-    (void)reason;
+    if (reason == DLL_PROCESS_ATTACH) g_proxyModule = instance;
     return TRUE;
 }

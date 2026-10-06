@@ -35,6 +35,10 @@ namespace wxl::runtime::extensions
      */
     bool InstallLoader();
 
+    // Called only by the deferred core worker, never under DllMain's loader lock.
+    // A timeout must not enable a partially registered extension hook chain.
+    bool WaitForLoadCompletion(uint32_t timeoutMs);
+
     /**
      * @brief Publishes a service into the same interface table WXL_Api::PublishInterface writes.
      *
@@ -47,4 +51,12 @@ namespace wxl::runtime::extensions
      * @param iface    pointer to the service, valid for the process lifetime.
      */
     void PublishInterface(const char* name, uint32_t version, void* iface);
+
+    /**
+     * @brief Resolves a service published by an already-loaded extension.
+     *
+     * Core features use this only at runtime, after the extension loader has run. A missing service
+     * is ordinary input and returns nullptr, allowing a feature to retain the stock rendering path.
+     */
+    void* GetInterface(const char* name, uint32_t version);
 }

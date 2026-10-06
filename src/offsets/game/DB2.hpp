@@ -23,6 +23,45 @@
 // each replaced table. Modules never include this; they use wxl::game / wxl::events.
 namespace wxl::offsets::game::db2
 {
+    // Generic row accessor shared by the client's data tables: yields the record for an id, or null
+    // when the table carries no such row. ECX = its ID-index subobject, NOT storage base.
+    // Build 12340 reads min/max/index at ECX-8 / ECX-12 / ECX+8 respectively.
+    constexpr uintptr_t kClientDbGetRow = 0x0065C290;
+    using ClientDbGetRowFn = void*(__thiscall*)(void* indexSubobject, uint32_t id);
+
+    // Animation table: what an animation id means, and what to play instead when a model lacks it.
+    namespace animationdata
+    {
+        constexpr uintptr_t kStorageObject = 0x00AD30C8;
+        // Verified against Unit.ResolveModelAnimation's inlined AnimationData lookup.
+        constexpr uintptr_t kRowIndexObject = kStorageObject + 0x18;
+        static_assert(kRowIndexObject - 8 == 0x00AD30D8);
+        static_assert(kRowIndexObject - 12 == 0x00AD30D4);
+        static_assert(kRowIndexObject + 8 == 0x00AD30E8);
+
+        // Highest id the native resolver accepts. Its fallback walk marks visited ids in a
+        // stack-allocated array indexed by the id itself, so the bound is that buffer's size rather
+        // than anything about the table: an id above it is refused before the walk starts, even when
+        // the model carries the sequence. Never hand the native entries an id past this.
+        constexpr uint32_t kLastStockId = 505;
+
+#pragma pack(push, 1)
+        /** @brief One animation row: its identity, its classification bits, and its fallback id. */
+        struct Row
+        {
+            uint32_t    id;
+            const char* name;
+            uint32_t    weaponFlags;
+            uint32_t    bodyFlags;
+            uint32_t    flags;
+            uint32_t    fallback;      // id to play instead when the model lacks this one (0 = none)
+            uint32_t    behaviorId;
+            uint32_t    behaviorTier;
+        };
+#pragma pack(pop)
+        static_assert(sizeof(Row) == 32, "AnimationData row stride");
+    }
+
     // Item DBC. Several hot consumers read this ID table inline instead of calling the generic accessor.
     namespace item
     {

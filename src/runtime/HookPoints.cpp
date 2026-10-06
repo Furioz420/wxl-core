@@ -33,10 +33,12 @@
 #include "offsets/engine/Sky.hpp"
 #include "offsets/engine/Sound.hpp"
 #include "offsets/game/ADT.hpp"
+#include "offsets/game/Companion.hpp"
 #include "offsets/game/DB2.hpp"
 #include "offsets/game/Doodad.hpp"
 #include "offsets/game/GroundEffect.hpp"
 #include "offsets/game/M2.hpp"
+#include "offsets/game/Network.hpp"
 #include "offsets/game/Unit.hpp"
 #include "offsets/game/Weather.hpp"
 #include "offsets/game/WMO.hpp"
@@ -53,6 +55,7 @@ namespace wxl::runtime::hookpoints
         namespace adt    = wxl::offsets::game::adt;
         namespace boot   = wxl::offsets::engine::boot;
         namespace cam    = wxl::offsets::engine::camera;
+        namespace companion = wxl::offsets::game::companion;
         namespace addon  = wxl::offsets::engine::addon;
         namespace db2    = wxl::offsets::game::db2;
         namespace dd     = wxl::offsets::game::doodad;
@@ -64,6 +67,7 @@ namespace wxl::runtime::hookpoints
         namespace lua    = wxl::offsets::engine::lua;
         namespace mem    = wxl::offsets::engine::mem;
         namespace m2     = wxl::offsets::game::m2;
+        namespace net    = wxl::offsets::game::network;
         namespace shoff  = wxl::offsets::engine::shader;
         namespace sky    = wxl::offsets::engine::sky;
         namespace snd    = wxl::offsets::engine::sound;
@@ -154,6 +158,7 @@ namespace wxl::runtime::hookpoints
             { "Gx.StateDirty",                             shoff::kGxStateDirty },
             { "Gx.RenderStateSet",                         adt::kGxRsSetInt },
             { "Gx.LiquidRenderPass",                       gxoff::kLiquidRenderPass },
+            { "Gx.DeviceDraw",                             gxoff::kDeviceDraw },
 
             // --- programmable shader path ------------------------------------------------------------
             { "Shader.EffectActivate",                     shoff::kEffectActivate },
@@ -285,6 +290,7 @@ namespace wxl::runtime::hookpoints
             { "World.FrameScreenEffectUpdate",             wld::kFrameScreenEffectUpdate },
             { "World.DetailDoodadDistSet",                 wld::kDetailDoodadDistSet },
             { "World.ParamDefaultsApply",                  wld::kParamDefaultsApply },
+            { "World.ExtShadowQualityCallback",            wld::kExtShadowQualityCallback },
             { "World.ParamInitialize",                     wld::kParamInitialize },
             // World scene and view setup
             { "World.NdcClip",                             wld::kNdcClip },
@@ -451,6 +457,9 @@ namespace wxl::runtime::hookpoints
             { "Unit.ObjectUpdate",                         unit::kObjectUpdateHandler },
             { "Unit.ObjectDestroy",                        unit::kObjectDestroyHandler },
             { "Unit.TargetSet",                            unit::kTargetSet },
+            { "Unit.ResolveModelAnimation",                unit::kResolveModelAnimation },
+            { "Network.ProcessMessage",                    net::kProcessMessage },
+            { "Client.CompanionSort",                      companion::kSort },
 
             // --- client data tables ------------------------------------------------------------------
             { "Db2.MapLoad",                               db2::mapdef::kLoader },
@@ -509,6 +518,8 @@ namespace wxl::runtime::hookpoints
             { "M2.TrackEvalQuat",                          m2::kTrackEvalQuat },
             { "M2.BuildBonePalette",                       m2::kBuildBonePalette },
             { "M2.BuildBonePaletteSimple",                 m2::kBuildBonePaletteSimple },
+            { "M2.HasPlayableAnimation",                   m2::kModelHasPlayableAnimation },
+            { "M2.FindPlayableAnimation",                  m2::kModelFindPlayableAnimation },
             { "M2.IsDrawable",                             m2::kIsDrawable },
             { "M2.IsBatchDoodadCompatible",                m2::kIsBatchDoodadCompatible },
             { "M2.SetupMaterial",                          m2::kSetupMaterial },

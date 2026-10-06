@@ -21,4 +21,11 @@ namespace wxl::features
     /// In-game ImGui overlay, toggled with F9, hosting the tuning panels. It consumes input ONLY
     /// while it is open, so leaving it compiled in costs a hidden overlay and nothing else.
     inline constexpr bool imguiOverlay = true;
+
+    // Environment canary. These remain compile-time gates so a bad renderer can be disabled and
+    // rebuilt without altering any asset or extension contract.
+    inline constexpr bool wind          = true;
+    inline constexpr bool water         = true;
+    inline constexpr bool retailClouds  = true;
+    inline constexpr bool retailGrading = true;
 }

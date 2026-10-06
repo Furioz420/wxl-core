@@ -20,7 +20,7 @@
 
 #include <stdint.h>
 
-// Backed by TextureFilePath.db2 / ModelFilePath.db2 / TextureFileData.db2, read the same way every
+// Backed by TextureFilePath.db2 / ModelFilePath.db2, read the same way every
 // other client-side asset is: through the client's own already-mounted archive set (see wxl-db2's
 // storage seam), no separate process involved. wxl-adt/wxl-wmo/wxl-m2 fetch this once at load and keep
 // the pointer for the process lifetime, same as WXL_Api itself.

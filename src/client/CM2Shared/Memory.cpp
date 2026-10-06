@@ -25,6 +25,7 @@
 #include "runtime/Extensions.hpp"
 
 #include "common/Config.hpp"
+#include "engine/storage/StorageHook.hpp"
 #include "common/Log.hpp"
 #include "wxl/M2ArenaApi.h"
 
@@ -32,6 +33,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -65,13 +67,19 @@ namespace
         uintptr_t address = reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
         const uintptr_t maximum = reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
         uint64_t committed = 0, reserved = 0, freeBytes = 0, largestFree = 0;
+        uint64_t privateBytes = 0, mappedBytes = 0, imageBytes = 0;
         while (address < maximum)
         {
             MEMORY_BASIC_INFORMATION mbi{};
             if (!VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) || !mbi.RegionSize)
                 break;
             const uint64_t bytes = static_cast<uint64_t>(mbi.RegionSize);
-            if (mbi.State == MEM_COMMIT) committed += bytes;
+            if (mbi.State == MEM_COMMIT) {
+                committed += bytes;
+                if (mbi.Type == MEM_PRIVATE) privateBytes += bytes;
+                else if (mbi.Type == MEM_MAPPED) mappedBytes += bytes;
+                else if (mbi.Type == MEM_IMAGE) imageBytes += bytes;
+            }
             else if (mbi.State == MEM_RESERVE) reserved += bytes;
             else if (mbi.State == MEM_FREE)
             {
@@ -83,6 +91,8 @@ namespace
             address = next;
         }
 
+        WLOG_INFO("memory-types-v1: private_mb=%.1f mapped_mb=%.1f image_mb=%.1f",
+            privateBytes / (1024.0 * 1024.0), mappedBytes / (1024.0 * 1024.0), imageBytes / (1024.0 * 1024.0));
         uint64_t arenaFree = 0, arenaLargest = 0;
         {
             std::lock_guard<std::mutex> lock(g_arenaMutex);
@@ -261,6 +271,8 @@ namespace
     void __cdecl ApiLogAddressSpace(const char* reason)
     {
         LogClientAddressSpace(reason);
+        if (reason && strcmp(reason, "periodic-v1") == 0)
+            wxl::runtime::storage::LogMemoryOwners();
     }
 
     WXL_M2ArenaApi g_m2ArenaApi = {

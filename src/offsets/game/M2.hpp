@@ -754,6 +754,11 @@ namespace wxl::offsets::game::m2
     // Per-render-ctx per-frame update: fires once per visible M2 instance per frame, recursively
     // through the scene graph. Hooked to drive bone-matrix copy and geoset filtering.
     constexpr uintptr_t kM2PerFrameUpdate      = 0x00828A00;
+    // Playable-sequence queries. The stock resolver treats AnimationData's CurrentOrNone value
+    // (506) as its ceiling; modern models may carry valid sequence IDs above it.
+    constexpr uintptr_t kM2DataHasSequenceById       = 0x00825E00;
+    constexpr uintptr_t kModelHasPlayableAnimation   = 0x00826050;
+    constexpr uintptr_t kModelFindPlayableAnimation  = 0x00825F40;
     // CharModel equip-slot handler (cmo, modelSlot, itemDataPtr, postFlag): dispatches an item to
     // an internal model slot, building paths and loading the M2.
     constexpr uintptr_t kCharModelSlotDispatch = 0x004F2640;
@@ -1467,6 +1472,7 @@ namespace wxl::offsets::game::m2
         uint32_t drawIndex, void* skinSection, void* previousSection);
     // SlotDispatch(cmo, edx, modelSlot, itemDataPtr, postFlag): equip-slot handler; loads the model.
     using M2_SlotDispatchFn     = void (__fastcall*)(void* cmo, void* edx, uint32_t modelSlot, void* itemDataPtr, uint32_t postFlag);
+    using M2_HasSequenceByIdFn  = bool (__stdcall*)(void* modelData, uint32_t animationId);
     // SlotClear(cmo, edx, equipSlotWow): clears a WoW equipment slot on the CMO.
     using M2_SlotClearFn        = void (__fastcall*)(void* cmo, void* edx, uint32_t equipSlotWow);
 

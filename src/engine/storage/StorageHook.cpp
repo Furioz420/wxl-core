@@ -28,6 +28,10 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdint>
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <new>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -48,7 +52,7 @@ namespace
      * @brief Synthetic file handle matching the native 0x30-byte file layout.
      *
      * The +0x14/+0x18/+0x1c fields match the native size/buffer/position fields the engine may read
-     * directly. Kept at the native size and layout even though every field past +0x1c is now unused
+     * directly. Kept at the native size and layout with +0x28 retaining an internal vector owner
      * -- other client code may still assume a file handle is 0x30 bytes.
      */
     struct SyntheticFile
@@ -59,11 +63,11 @@ namespace
         char*    shortName;    // +0x0c
         char*    fullName;     // +0x10
         uint32_t size;         // +0x14
-        uint8_t* buffer;       // +0x18  whole-file bytes, always malloc'd
+        uint8_t* buffer;       // +0x18  aliases the vector owned by reserved28
         uint32_t position;     // +0x1c
         uint32_t reserved20;   // +0x20
         uint32_t reserved24;   // +0x24
-        void*    reserved28;   // +0x28
+        void*    reserved28;   // +0x28  owning std::vector<uint8_t>*
         void*    reserved2c;   // +0x2c
     };
 #pragma pack(pop)
@@ -234,31 +238,64 @@ namespace
         return p;
     }
 
-    /**
-     * @brief Builds a buffered synthetic handle owning a copy of bytes.
-     * @param name  file name the handle answers to (logging + module filters).
-     * @param data  bytes to copy in; may be null when size is 0.
-     * @param size  byte count.
-     * @return the new handle, or null on allocation failure.
-     */
-    SyntheticFile* BuildBufferedHandle(const std::string& name, const uint8_t* data, uint32_t size)
-    {
-        auto* f = static_cast<SyntheticFile*>(calloc(1, sizeof(SyntheticFile)));
-        if (!f) return nullptr;
-        f->magic = kHandleMagic;
-        f->size = size;
-        f->buffer = static_cast<uint8_t*>(malloc(size ? size : 1));
-        if (!f->buffer) { free(f); return nullptr; }
-        if (size && data) memcpy(f->buffer, data, size);
-        f->fullName = DupName(name.c_str());
-        f->shortName = f->fullName;
+    std::atomic<uint64_t> g_bufferBytes{0};
+    std::atomic<uint32_t> g_bufferHandles{0};
+    HANDLE g_memoryReport = INVALID_HANDLE_VALUE;
+    thread_local const char* g_allocationStage = "open";
+    thread_local uint32_t g_requestedBytes = 0;
 
-        for (wxl::runtime::storage::ServeFilterFn filter : ServeFiltersSnapshot())
+    // Opened during startup, so this path does not need to allocate a filename,
+    // build a dialog, or initialize a logging sink after memory is exhausted.
+    void ReportAllocationFailure(const char* name) noexcept
+    {
+        char text[1024];
+        const int count = snprintf(text, sizeof(text),
+            "WXL storage allocation failed: stage=%s requested=%u asset=%.512s "
+            "live_handles=%u live_capacity=%llu\r\n",
+            g_allocationStage, g_requestedBytes, name ? name : "(unknown)",
+            g_bufferHandles.load(), static_cast<unsigned long long>(g_bufferBytes.load()));
+        if (count > 0 && g_memoryReport != INVALID_HANDLE_VALUE)
+        {
+            DWORD written = 0;
+            WriteFile(g_memoryReport, text,
+                static_cast<DWORD>((std::min)(count, int(sizeof(text) - 1))), &written, nullptr);
+            FlushFileBuffers(g_memoryReport);
+        }
+        OutputDebugStringA(text);
+    }
+
+    void DestroyBufferedHandle(SyntheticFile* f) noexcept
+    {
+        delete static_cast<std::vector<uint8_t>*>(f->reserved28);
+        free(f->fullName);
+        free(f);
+    }
+
+    // Move the vector allocation into the handle. The native +0x18 pointer is
+    // stable until CloseDetour; no second full-size payload allocation occurs.
+    SyntheticFile* BuildBufferedHandle(const std::string& name, std::vector<uint8_t>&& bytes)
+    {
+        g_allocationStage = "buffered-handle";
+        g_requestedBytes = static_cast<uint32_t>(bytes.size());
+        auto* f = static_cast<SyntheticFile*>(calloc(1, sizeof(SyntheticFile)));
+        if (!f) throw std::bad_alloc();
+        std::unique_ptr<SyntheticFile, decltype(&DestroyBufferedHandle)> guard(f, &DestroyBufferedHandle);
+        f->magic = kHandleMagic;
+        auto* owner = new std::vector<uint8_t>(std::move(bytes));
+        f->reserved28 = owner;
+        f->size = static_cast<uint32_t>(owner->size());
+        f->buffer = owner->data();
+        f->fullName = DupName(name.c_str());
+        if (!f->fullName) throw std::bad_alloc();
+        f->shortName = f->fullName;
+        for (auto filter : ServeFiltersSnapshot())
         {
             const uint32_t served = filter(name.c_str(), f->buffer, f->size);
             if (served < f->size) f->size = served;
         }
-        return f;
+        g_bufferBytes.fetch_add(owner->capacity());
+        g_bufferHandles.fetch_add(1);
+        return guard.release();
     }
 
     /**
@@ -273,7 +310,7 @@ namespace
         for (auto fn : ClientProvidersSnapshot())
         {
             if (!fn(name.c_str(), provided)) continue;
-            SyntheticFile* f = BuildBufferedHandle(name, provided.data(), static_cast<uint32_t>(provided.size()));
+            SyntheticFile* f = BuildBufferedHandle(name, std::move(provided));
             if (!f) break;
             if (out) *out = f;
             ++g_served;
@@ -328,15 +365,20 @@ namespace
         const uint32_t size = g_origSize(handle, &sizeHigh);
         if (sizeHigh != 0 || size == 0) return; // >4GB or empty: not a texture, leave native
 
+        g_allocationStage = "transform-input";
+        g_requestedBytes = size;
         std::vector<uint8_t> raw(size);
         uint32_t got = 0;
         const bool readOk = g_origRead(handle, raw.data(), size, &got, nullptr, 0) && got == size;
         if (readOk)
         {
             std::vector<uint8_t> reshaped;
+            g_allocationStage = "transform-output";
             if (transform(name.c_str(), raw, reshaped))
             {
-                SyntheticFile* f = BuildBufferedHandle(name, reshaped.data(), static_cast<uint32_t>(reshaped.size()));
+                // The transform is synchronous and reshaped owns its bytes.
+                std::vector<uint8_t>().swap(raw);
+                SyntheticFile* f = BuildBufferedHandle(name, std::move(reshaped));
                 if (f)
                 {
                     g_origClose(handle);
@@ -380,19 +422,35 @@ namespace
 
     int __stdcall OpenDetour(void* archive, const char* name, uint32_t flags, void** out)
     {
+        // Allocation failure is an unsuccessful open, never a request to feed
+        // incompatible unconverted bytes to the native decoder.
+        if (out) *out = nullptr;
+        void* native = nullptr;
         std::string redirected;
-        name = Redirect(name, redirected);
-
-        if (TryServe(archive, name, out)) return 1;
-
-        const int result = g_origOpen(archive, name, flags, out);
-        if (result != 0 && out && *out)
+        try
         {
-            std::string safeName;
-            if (CopyArchiveName(name, safeName) && ShouldIntercept(safeName))
-                TryNativeTransform(safeName, *out, out);
+            g_allocationStage = "redirect-or-provider";
+            g_requestedBytes = 0;
+            name = Redirect(name, redirected);
+            if (TryServe(archive, name, out)) return 1;
+            const int result = g_origOpen(archive, name, flags, &native);
+            if (result != 0 && native)
+            {
+                std::string safeName;
+                if (CopyArchiveName(name, safeName) && ShouldIntercept(safeName))
+                    TryNativeTransform(safeName, native, &native);
+            }
+            if (out) *out = native;
+            return result;
         }
-        return result;
+        catch (const std::bad_alloc&)
+        {
+            // Redirect scratch is kept alive until this report has used name.
+            ReportAllocationFailure(name);
+            if (native) g_origClose(native);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        }
     }
 
     /**
@@ -470,9 +528,10 @@ namespace
         if (IsOurs(handle))
         {
             auto* f = reinterpret_cast<SyntheticFile*>(handle);
-            free(f->buffer);
-            free(f->fullName);
-            free(f);
+            auto* owner = static_cast<std::vector<uint8_t>*>(f->reserved28);
+            g_bufferBytes.fetch_sub(owner->capacity());
+            g_bufferHandles.fetch_sub(1);
+            DestroyBufferedHandle(f);
             return 1;
         }
         return g_origClose(handle);
@@ -499,6 +558,12 @@ namespace
 
 namespace wxl::runtime::storage
 {
+    void LogMemoryOwners()
+    {
+        WLOG_INFO("storage-memory-v1: live_handles=%u live_capacity_mb=%.1f",
+            g_bufferHandles.load(), double(g_bufferBytes.load()) / (1024.0 * 1024.0));
+    }
+
     /**
      * @brief Arms the archive-mount safety nets (required-archive hard-fail gate, expansion-content
      *        flag force). Independent of Install(); every archive -- named, loose-directory, or a
@@ -532,6 +597,18 @@ namespace wxl::runtime::storage
      */
     void Install()
     {
+        char path[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+        if (length && length < MAX_PATH)
+        {
+            char* slash = strrchr(path, '\\');
+            if (slash && size_t(slash - path) + 24 < MAX_PATH)
+            {
+                strcpy(slash + 1, "wxl-memory-failure.log");
+                g_memoryReport = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ,
+                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+        }
         wxl::hook::Install("Storage_FileOpen",  io::kFileOpen,  &OpenDetour, &g_origOpen);
         wxl::hook::Install("Storage_FileSize",  io::kFileSize,  &SizeDetour, &g_origSize);
         wxl::hook::Install("Storage_FileRead",  io::kFileRead,  &ReadDetour, &g_origRead);

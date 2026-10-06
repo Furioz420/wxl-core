@@ -113,4 +113,7 @@ namespace wxl::runtime::storage
 
     /** Registers a served-bytes filter; safe from a module global constructor. */
     void RegisterServeFilter(ServeFilterFn fn);
+
+    // Snapshot counters only; called by the opt-in periodic memory trace.
+    void LogMemoryOwners();
 }

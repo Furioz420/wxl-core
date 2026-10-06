@@ -44,6 +44,11 @@ namespace wxl::offsets::engine::sound
     using PlaySoundKitFn = int(__cdecl*)(int soundKitId, int p2, int p3, int* p4, int p5,
                                           uint32_t* p6, uint32_t p7, int p8);
 
+    // Native ItemDisplayInfo -> ItemGroupSounds action player. Action 0 is pickup and action 1 is
+    // putdown/equip. The variant bridge uses this only after the retail display row is resolved.
+    constexpr uintptr_t kPlayItemDisplaySound = 0x004D0090;
+    using PlayItemDisplaySoundFn = void(__cdecl*)(uint32_t action, uint32_t displayId);
+
     // Sound-group array pointer; the first group's field at +0x08 holds the live master-volume float.
     constexpr uintptr_t kSoundGroupArrayPtr  = 0x00D438FC;
     constexpr size_t    kOffGroupMasterVolume = 0x08;

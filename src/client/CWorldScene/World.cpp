@@ -22,11 +22,13 @@
 
 #include "common/Log.hpp"
 #include "common/Mem.hpp"
+#include "game/Script.hpp"
 #include "offsets/engine/Frame.hpp"
 #include "offsets/game/ADT.hpp"
 #include "offsets/game/World.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace
 {
@@ -38,6 +40,47 @@ namespace
 
     wld::World_EnterFn g_origWorldEnter = nullptr;
     frame::FramePumpFn g_origFramePump  = nullptr;
+    wld::ParamCVarCallbackFn g_origExtShadowQuality = nullptr;
+    bool g_normalizeExtShadowCVar = false;
+
+    /**
+     * @brief Prevents the broken quality-zero precomputed terrain-shadow path from being activated.
+     *
+     * The current renderer stack preserves quality 1-5, but the stock quality-zero path consumes its
+     * terrain shadow alpha with the legacy layout and corrupts affected terrain chunks. Passing quality
+     * one to the native callback makes the renderer safe immediately. The owning CVar system still sees
+     * the caller's original text after this validator returns, so an OnUpdate repair stores the effective
+     * value as well; GetCVar and Config.wtf consequently report 1 rather than a misleading 0.
+     */
+    int __cdecl hkExtShadowQuality(void* cvar, void* callbackData, const char* requestedValue)
+    {
+        const int requested = requestedValue ? std::atoi(requestedValue) : 0;
+        if (requested < 1)
+        {
+            static unsigned logged = 0;
+            if (logged++ < 8)
+                WLOG_INFO("world: extShadowQuality %d normalized to compatibility floor 1", requested);
+
+            g_normalizeExtShadowCVar = true;
+            return g_origExtShadowQuality(cvar, callbackData, "1");
+        }
+
+        return g_origExtShadowQuality(cvar, callbackData, requestedValue);
+    }
+
+    /** @brief Persists a callback-normalized shadow quality after the outer native CVar set completes. */
+    void NormalizeExtShadowQuality(void*, const void*)
+    {
+        if (!g_normalizeExtShadowCVar || !wxl::game::script::CurrentState())
+            return;
+
+        g_normalizeExtShadowCVar = false;
+        wxl::game::script::Execute(
+            "if tonumber(GetCVar(\"extShadowQuality\")) and "
+            "tonumber(GetCVar(\"extShadowQuality\")) < 1 then "
+            "SetCVar(\"extShadowQuality\", \"1\") end",
+            "wxl-ext-shadow-quality-floor");
+    }
 
     /**
      * @brief Detours world enter, emitting OnWorldLeave before and OnWorldEnter after the transition.
@@ -75,6 +118,9 @@ namespace
     {
         wxl::hook::Install("CWorldEnter", wld::kEnter, &hkWorldEnter, &g_origWorldEnter);
         wxl::hook::Install("FramePump", frame::kFramePump, &hkFramePump, &g_origFramePump);
+        wxl::hook::Install("ExtShadowQuality", wld::kExtShadowQualityCallback,
+                           &hkExtShadowQuality, &g_origExtShadowQuality);
+        ev::Subscribe(ev::Event::OnUpdate, &NormalizeExtShadowQuality, nullptr);
 
         // Liquid-row null guard: this one liquid consumer dereferences the LiquidType row flag without the
         // null check the others have, so an unknown liquid id (from any served source) faults. Skip the

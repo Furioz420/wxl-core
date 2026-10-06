@@ -20,6 +20,9 @@
 
 #include "common/Log.hpp"
 #include "game/Pick.hpp"
+#include "game/Gx.hpp"
+#include "WindowBinding.hpp"
+#include <d3d9.h>
 
 #include <windows.h>
 
@@ -28,8 +31,8 @@ namespace
     namespace ev    = wxl::events;
     namespace world = wxl::game::world;
 
-    HWND    g_hwnd        = nullptr;
-    WNDPROC g_origWndProc = nullptr;
+    wxl::input::WindowBinding& Binding()
+    { static auto* binding = new wxl::input::WindowBinding; return *binding; }
 
     /**
      * @brief Selects the top-level visible window owned by this process.
@@ -71,6 +74,36 @@ namespace
      */
     LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     {
+        const auto original = Binding().Original(h);
+        if (!original) return DefWindowProcA(h, m, w, l);
+        // Destruction must reach the native procedure even if an overlay is
+        // capturing input. Retire this HWND so handle reuse cannot inherit it.
+        if (m == WM_NCDESTROY)
+        {
+            const auto result = CallWindowProcA(original, h, m, w, l);
+            Binding().Forget(h);
+            return result;
+        }
+        if (h != Binding().Active()) return CallWindowProcA(original, h, m, w, l);
+        // A minimized client can occasionally receive the user's restore/activation request while
+        // remaining WS_MINIMIZE at the Win32 layer. WoW then quite correctly leaves the graphics
+        // device's visible/context flags false and spends every paint tick in OsSleep, which looks
+        // like a frozen client after switching back. Re-issuing the ordinary Win32 restore only when
+        // the user is actively restoring/activating the app repairs that missed transition without
+        // changing the client's intentional background behaviour while it remains minimized.
+        const bool restoreCommand =
+            m == WM_SYSCOMMAND && (w & 0xFFF0u) == SC_RESTORE;
+        const bool activating =
+            (m == WM_ACTIVATEAPP && w != FALSE) ||
+            (m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE);
+        if ((restoreCommand || activating) && IsIconic(h))
+        {
+            static unsigned logged = 0;
+            if (logged++ < 4)
+                WLOG_INFO("input: repairing missed window restore (message=0x%04X)", m);
+            ShowWindowAsync(h, SW_RESTORE);
+        }
+
         bool handled = false;
         ev::InputArgs a{ m, static_cast<uintptr_t>(w), static_cast<uintptr_t>(l), &handled };
         ev::Emit(ev::Event::OnInput, &a);
@@ -86,7 +119,21 @@ namespace
                 ev::Emit(ev::Event::OnWorldClick, &wc);
             }
         }
-        return CallWindowProcA(g_origWndProc, h, m, w, l);
+        return CallWindowProcA(original, h, m, w, l);
+    }
+
+    void ReconcileInput(void*, const void*)
+    {
+        HWND window = nullptr;
+        if (auto* device = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
+        {
+            D3DDEVICE_CREATION_PARAMETERS params{};
+            if (SUCCEEDED(device->GetCreationParameters(&params))) window = params.hFocusWindow;
+        }
+        if (!window || !IsWindow(window)) window = FindGameWindow();
+        if (!window || window == Binding().Active()) return;
+        if (Binding().Bind(window, WndProc))
+            WLOG_INFO("input: window subclassed (hwnd=%p), OnInput live", window);
     }
 
     /**
@@ -97,15 +144,9 @@ namespace
      */
     bool InstallInput()
     {
-        if (g_origWndProc) return true; // already installed
-        g_hwnd = FindGameWindow();
-        if (!g_hwnd) { WLOG_WARN("input: game window not found, OnInput inactive"); return true; }
-
-        g_origWndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&WndProc)));
-        if (!g_origWndProc) { WLOG_WARN("input: SetWindowLongPtr failed (%lu)", GetLastError()); return true; }
-
-        WLOG_INFO("input: window subclassed (hwnd=%p), OnInput live", g_hwnd);
+        ReconcileInput(nullptr, nullptr);
+        ev::Subscribe(ev::Event::OnUpdate, ReconcileInput, nullptr);
+        ev::Subscribe(ev::Event::OnEndScene, ReconcileInput, nullptr);
         return true;
     }
 }

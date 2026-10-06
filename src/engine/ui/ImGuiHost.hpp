@@ -26,7 +26,7 @@ namespace wxl::ui
     using PanelFn = void (__cdecl *)(void* user);
 
     /**
-     * @brief Registers a panel to be drawn whenever the overlay is open.
+     * @brief Registers a panel that can be enabled in the F9 tools launcher.
      *
      * Panels register at feature-install time, cold, and are never removed. The host owns no
      * knowledge of what any of them do -- a panel is the only thing a feature needs to write to put
@@ -37,7 +37,16 @@ namespace wxl::ui
      * @param fn     body, invoked inside an already-open window.
      * @param user   opaque pointer handed back to @p fn.
      */
-    void AddPanel(const char* title, PanelFn fn, void* user);
+    void AddPanel(const char* title, PanelFn fn, void* user,
+                  float firstWidth = 0.0f, float firstHeight = 0.0f);
+
+    /**
+     * @brief Registers a workspace that can be enabled in the F9 tools launcher.
+     *
+     * Unlike AddPanel, the host does not wrap this callback in ImGui::Begin/End. This is used by
+     * workspaces such as the Water tuner, whose toolbar opens several independently movable windows.
+     */
+    void AddWindowOwner(const char* name, PanelFn fn, void* user);
 
     /// True while the overlay is open and taking input.
     bool IsOpen();

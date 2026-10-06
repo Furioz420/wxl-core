@@ -263,6 +263,12 @@ namespace wxl::game::m2
         Native<off::M2_BindTexSlotFn>(off::kBindTexSlot)(renderCtx, nullptr, 2, modelPtr);
     }
 
+    inline void BindTexSlotType(void* renderCtx, uint32_t textureType, void* modelPtr)
+    {
+        Native<off::M2_BindTexSlotFn>(off::kBindTexSlot)(
+            renderCtx, nullptr, textureType, modelPtr);
+    }
+
     /**
      * @brief Loads a resource by virtual path through the global resource-loader object.
      * @param path   the virtual path (e.g. "Item\\ObjectComponents\\Weapon\\AxeSmall.M2").

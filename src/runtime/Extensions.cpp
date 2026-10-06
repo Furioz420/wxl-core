@@ -14,12 +14,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+#include "runtime/StartupCompletion.hpp"
 #include "runtime/Extensions.hpp"
+#include "extension-support/environment/UiApi.hpp"
 
 #include "wxl/PluginApi.h"
 
 #include "common/Log.hpp"
 #include "engine/events/Event.hpp"
+#include "engine/render/RenderService.hpp"
+#include "engine/render/DepthService.hpp"
 #include "engine/hook/Hook.hpp"
 #include "engine/ui/ImGuiHost.hpp"
 #include "game/Boot.hpp"
@@ -128,15 +132,34 @@ namespace wxl::runtime::extensions
         ApiPublishInterface(name, version, iface);
     }
 
+    void* GetInterface(const char* name, uint32_t version)
+    {
+        if (!name) return nullptr;
+        if (version == 1 && std::strcmp(name, "wxl.environment-ui") == 0)
+            return const_cast<WXL_EnvironmentUiApi*>(wxl::ui::EnvironmentApi());
+        if (version == WXL_RENDER_API_VERSION && std::strcmp(name, "wxl.render") == 0)
+            return const_cast<WXL_RenderApi*>(wxl::render::Api());
+        if (version == WXL_RENDER_CONTROL_API_VERSION && std::strcmp(name, "wxl.render-control") == 0)
+            return const_cast<WXL_RenderControlApi*>(wxl::render::ControlApi());
+        if(version==WXL_MULTISAMPLE_DEPTH_API_VERSION && std::strcmp(name,"wxl.multisample-depth")==0)
+            return const_cast<WXL_MultisampleDepthApi*>(wxl::render::depth::MultisampleApi());
+        if (version == WXL_RENDER_DEPTH_API_VERSION && std::strcmp(name, "wxl.render-depth") == 0)
+            return const_cast<WXL_RenderDepthApi*>(wxl::render::depth::Api());
+        if (version == WXL_LIQUID_DEPTH_API_VERSION && std::strcmp(name, "wxl.liquid-depth") == 0)
+            return const_cast<WXL_LiquidDepthApi*>(wxl::render::depth::LiquidApi());
+        if (version == WXL_WATER_DEPTH_API_VERSION && std::strcmp(name, "wxl.water-depth") == 0)
+            return const_cast<WXL_WaterDepthApi*>(wxl::render::depth::WaterApi());
+        for (const Service& service : Services())
+            if (service.version == version && service.name == name) return service.iface;
+        return nullptr;
+    }
+
     namespace
     {
 
         void* __cdecl ApiGetInterface(const char* name, uint32_t version)
         {
-            if (!name) return nullptr;
-            for (const Service& service : Services())
-                if (service.version == version && service.name == name) return service.iface;
-            return nullptr;
+            return GetInterface(name, version);
         }
 
         const WXL_Api g_api = {
@@ -258,8 +281,17 @@ namespace wxl::runtime::extensions
             } while (FindNextFileA(search, &entry));
             FindClose(search);
 
-            // Enumeration order is a filesystem detail; load order has to be reproducible.
-            std::sort(folders.begin(), folders.end());
+            // Enumeration order is a filesystem detail; load order has to be reproducible. The
+            // runtime extension publishes wxl.network and wxl.framescript, so it is the one named
+            // provider that must precede consumers whose alphabetical name sorts before it (for
+            // example wxl-challenge-mode). The remaining extensions retain lexical order.
+            std::sort(folders.begin(), folders.end(), [](const std::string& left,
+                                                         const std::string& right) {
+                const bool leftRuntime = left == "wxl-runtime";
+                const bool rightRuntime = right == "wxl-runtime";
+                if (leftRuntime != rightRuntime) return leftRuntime;
+                return left < right;
+            });
 
             int loaded = 0;
             for (const std::string& folder : folders)
@@ -278,6 +310,7 @@ namespace wxl::runtime::extensions
         }
 
         game::boot::EngineInitFn g_origEngineInit = nullptr;
+        StartupCompletion g_loadComplete;
 
         /**
          * @brief Loads the extensions, then lets engine initialisation proceed.
@@ -295,9 +328,15 @@ namespace wxl::runtime::extensions
                 loaded = true;
                 LoadAll();
                 hook::EnableAll();
+                g_loadComplete.Complete();
             }
             return g_origEngineInit();
         }
+    }
+
+    bool WaitForLoadCompletion(uint32_t timeoutMs)
+    {
+        return g_loadComplete.Wait(std::chrono::milliseconds(timeoutMs));
     }
 
     bool InstallLoader()

@@ -50,7 +50,7 @@ namespace
 
     off::M2_SetModelIndicesFn   g_origSetModelIndices  = nullptr;
     off::M2_SharedSetIndicesFn  g_origSharedSetIndices = nullptr;
-    gxoff::GxDeviceDrawFn       g_origDeviceDraw       = nullptr;
+    gxoff::GxDeviceDrawUnsignedFn       g_origDeviceDraw       = nullptr;
     off::M2_SharedSetVerticesFn g_origSharedSetVertices = nullptr;
     using DrawBatchFn = void(__fastcall*)(void* ctx, void* edx);
     DrawBatchFn                 g_origDrawBatch        = nullptr;
@@ -586,4 +586,5 @@ namespace
     }
 }
 
-WXL_REGISTER_FEATURE("m2native-indices", true, InstallWideIndices)
+// Preserve the accepted local disabled baseline; enable only in a focused wide-vertex test.
+WXL_REGISTER_FEATURE("m2native-indices", false, InstallWideIndices)

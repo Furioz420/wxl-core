@@ -558,6 +558,12 @@ namespace wxl::offsets::game::adt
     /// Resolves which liquid the camera is in/under each frame -- the hook for underwater state, fog
     /// and camera-liquid effects driven by terrain water. __cdecl, caller-cleaned.
     constexpr uintptr_t kUpdateViewerLiquid                = 0x00790920;
+    // Read-only accessor used by Camera.UnderwaterCheck (5FE7B0). The producer
+    // above stores surfaceZ-cameraZ at CD8790 and LiquidType id at CD8794,
+    // including its WMO-local branch. Zero id means no queried liquid.
+    constexpr uintptr_t kGetViewerLiquid                   = 0x00780620;
+    using GetViewerLiquidFn = uint32_t(__cdecl*)(float* depthBelowSurface);
+
     /// The only per-frame consumer of the WDL low-detail tile grid -- the hook for changing how (or
     /// whether) the distant horizon terrain is culled and drawn. __cdecl, caller-cleaned.
     constexpr uintptr_t kCullHorizon                       = 0x00791980;

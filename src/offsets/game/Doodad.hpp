@@ -31,6 +31,20 @@ namespace wxl::offsets::game::doodad
     // __cdecl, 3 stack args, returns the new placed-doodad object pointer.
     using SpawnFromMDDFFn = void*(__cdecl*)(const char* modelName, void* mddf, void* tileOrigin);
 
+    // Builds a placed doodad embedded in a WMO group. WMO-authored instance
+    // portals use this separate overload and never pass through the MDDF path.
+    constexpr uintptr_t kSpawnFromWmoGroup = 0x007BEF40;
+    using SpawnFromWmoGroupFn = void*(__cdecl*)(
+        uint32_t id, void* definition, const char* modelName, void* placement,
+        void* parentMatrix, uint16_t doodadSet);
+
+    // Native CMapStaticEntity model initializer. Used to coherently replace a
+    // resident legacy portal model after the selected dungeon difficulty changes.
+    constexpr uintptr_t kCreateModel = 0x007BDA70;
+    using CreateModelFn = int(__cdecl*)(
+        const char* modelName, void* doodad, int waitForLoad,
+        int staticModelFlags);
+
     // The MDDF record kSpawnFromMDDF reads (0x24 bytes, standard MDDF layout, unchanged since
     // Classic): nameId/uniqueId (u32 each) at +0x00/+0x04, position (3 floats, archived coordinate
     // convention) at +0x08/+0x0C/+0x10, rotation at +0x14/+0x18/+0x1C, scale (u16, 1024 = 100%) at

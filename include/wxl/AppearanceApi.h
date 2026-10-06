@@ -168,6 +168,14 @@ typedef struct WXL_AppearanceApi
     const char*(__cdecl* OptionName)(uint32_t chrCustomizationOptionId);
     /// The name one of an option's choices shows ("Bald", "None", "Goatee").
     const char*(__cdecl* ChoiceName)(uint32_t chrCustomizationChoiceId);
+
+    /// The optional second half of a Retail colour swatch. This is appended so version-2 consumers
+    /// built against the earlier prefix remain ABI-compatible; test structSize before calling it.
+    uint32_t(__cdecl* ChoiceSwatchColor2)(uint32_t chrCustomizationChoiceId);
+
+    /// Retail's secondary presentation order. Values 1..4 retain the four legacy face/skin/hair
+    /// axes even when the table's primary row order differs. Optional appended version-2 field.
+    uint32_t(__cdecl* OptionSecondaryOrderIndex)(uint32_t chrCustomizationOptionId);
 } WXL_AppearanceApi;
 
 // LIFETIME. The three arrays a filled recipe points at belong to the resolver, not to the caller,

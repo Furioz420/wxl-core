@@ -64,6 +64,13 @@ namespace wxl::events
         OnGrassWind,     // grass wind integrator advanced this frame (GrassWindArgs)
         OnAdtHeightBlend,// a terrain PS permutation was patched for height blending (AdtHeightBlendArgs)
         OnM2NativeLoad,  // a modern MD21 model was direct-filled by the native reader (M2NativeLoadArgs)
+        // Eunoia model-facing events are appended to preserve every stock v1.1 event number.
+        OnItemDisplayApply, // a character model was asked to apply a display (ItemDisplayApplyArgs)
+        OnWeaponVisualChange, // a unit visible-item entry field was written (WeaponVisualChangeArgs)
+        OnLiquidRenderBegin, // before a native liquid bucket, with readable copy
+        OnLiquidRenderEnd, // after a native liquid bucket (LiquidRenderArgs)
+        OnNativeWorldBegin, // outer world only; WXL_RenderPassContext
+        OnNativeWorldEnd,   // paired finally boundary; no arguments
         Count
     };
 
@@ -125,8 +132,8 @@ namespace wxl::events
      */
     struct WorldSceneEndArgs  { void* device; void* sceneDepth; };
     /**
-     * @brief Args for OnLiquidRender, fired before the native liquid pass draws. passType is 0 for the
-     *        main pass, 1 for the secondary; instanceCount is the visible liquid instances in this pass;
+     * @brief Args for OnLiquidRender, fired before a native liquid bucket draws. passType is 0 or 1;
+     *        either can contain world liquids. instanceCount is the visible liquid instances in this bucket;
      *        transform is the shared liquid transform forwarded to each instance. Read-only.
      */
     struct LiquidRenderArgs  { void* bank; void* transform; int passType; uint32_t instanceCount; };
@@ -228,14 +235,28 @@ namespace wxl::events
      *        the call ran on; the sound id/name is on its stack. Read-only.
      */
     struct SoundPlayArgs     { void* scriptState; };
-    /** @brief Args for OnDoodadSpawn; read the transform via wxl::game::doodad. */
-    struct DoodadSpawnArgs   { void* doodad; };
+    /** @brief Args for OnDoodadSpawn; modelName is valid for the duration of the callback. */
+    struct DoodadSpawnArgs   { void* doodad; const char* modelName; };
     /** @brief Args for OnItemSlotChange; charModelObj is the CharModelObject, modelSlot is the internal
      *         model slot index (maps to an equipment category), itemDataPtr points to the item data block. */
     struct ItemSlotChangeArgs { void* charModelObj; uint32_t modelSlot; void* itemDataPtr; };
     /** @brief Args for OnItemSlotClear; charModelObj is the CharModelObject, equipSlotWow is the
      *         WoW equipment slot index (EQUIPMENT_SLOT_* constants, 0-18). */
     struct ItemSlotClearArgs  { void* charModelObj; uint32_t equipSlotWow; };
+    /** Emitted before native DBC lookup can suppress a DB2-only item display. */
+    struct ItemDisplayApplyArgs
+    {
+        void* charModelObj;
+        uint32_t modelSlot;
+        uint32_t displayId;
+        uint32_t postFlag;
+    };
+    struct WeaponVisualChangeArgs
+    {
+        void* unit;
+        uint32_t slot;
+        uint32_t itemEntry;
+    };
     /** @brief Args for OnM2PerFrameUpdate; renderCtx is the per-instance render context that the
      *         scene graph is updating -- fires once per visible M2 instance per frame. */
     struct M2PerFrameUpdateArgs { void* renderCtx; };

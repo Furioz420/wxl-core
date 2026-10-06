@@ -109,4 +109,36 @@ namespace wxl::game::shader
         if (index >= kAltEffectCount) return nullptr;
         return reinterpret_cast<const void* const*>(off::kAltEffectTable)[index];
     }
+    /// Signature of the `Shader.CreateVertex` named hook point.
+    using CreateVertexFn = void(__fastcall*)(void* device, void* edx, void* wrapper);
+
+    struct BytecodeView
+    {
+        const unsigned char* data = nullptr;
+        uint32_t             size = 0;
+    };
+
+    /** @brief Reads the bytecode pointer and length from a shader wrapper. */
+    inline BytecodeView VertexBytecode(const void* wrapper)
+    {
+        if (!wrapper)
+            return {};
+
+        const auto* bytes = static_cast<const unsigned char*>(wrapper);
+        return {
+            *reinterpret_cast<const unsigned char* const*>(bytes + off::kCgxShaderBytePtr),
+            *reinterpret_cast<const uint32_t*>(bytes + off::kCgxShaderByteLen)
+        };
+    }
+
+    /** @brief Replaces the bytecode pointer and length carried by a shader wrapper. */
+    inline void SetVertexBytecode(void* wrapper, const unsigned char* data, uint32_t size)
+    {
+        if (!wrapper)
+            return;
+
+        auto* bytes = static_cast<unsigned char*>(wrapper);
+        *reinterpret_cast<const unsigned char**>(bytes + off::kCgxShaderBytePtr) = data;
+        *reinterpret_cast<uint32_t*>(bytes + off::kCgxShaderByteLen) = size;
+    }
 }

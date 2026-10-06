@@ -56,9 +56,13 @@ namespace
         const char*      title;
         wxl::ui::PanelFn fn;
         void*            user;
+        float            firstWidth;
+        float            firstHeight;
+        bool             ownsWindows;
+        bool             visible = false;
     };
 
-    constexpr int kMaxPanels = 16;
+    constexpr int kMaxPanels = 24;
     Panel g_panels[kMaxPanels]{};
     int   g_panelCount = 0;
 
@@ -66,9 +70,9 @@ namespace
     bool  g_failed  = false;   // initialisation failed once; do not retry every frame
     bool  g_open    = false;   // overlay visible and taking input
     HWND  g_hwnd    = nullptr;
+    IDirect3DDevice9* g_device = nullptr; // borrowed; the initialized DX9 backend retains it
 
-    /// The toggle. Chosen because the client binds neither, and because a key that needs a modifier
-    /// is unreachable once the overlay is swallowing modifiers.
+    /// The general tools launcher. Depth diagnostics use F8 separately.
     constexpr int kToggleKey = VK_F9;
 
     HWND WindowOfDevice(IDirect3DDevice9* dev)
@@ -80,23 +84,39 @@ namespace
 
     bool EnsureReady(IDirect3DDevice9* dev)
     {
-        if (g_ready) return true;
-        if (g_failed || !dev) return false;
+        if (!dev) return false;
+        const HWND window = WindowOfDevice(dev);
+        if (g_ready && g_device == dev && g_hwnd == window) return true;
+        // Graphics settings can replace both device and window without Reset.
+        // Keep the ImGui context (layout/panel state), but retire both old backends.
+        if (g_ready)
+        {
+            ImGui_ImplDX9_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            g_ready = false;
+            WLOG_INFO("imgui: rebinding replaced graphics device/window");
+        }
+        if (g_device != dev || g_hwnd != window) g_failed = false;
+        if (g_failed) return false;
+        g_device = dev;
 
-        g_hwnd = WindowOfDevice(dev);
+        g_hwnd = window;
         if (!g_hwnd) { g_failed = true; WLOG_WARN("imgui: no window, overlay disabled"); return false; }
 
         IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGuiIO& io = ImGui::GetIO();
-        // No .ini: the overlay is a debugging surface, and a file that silently restores a window
-        // dragged off-screen three sessions ago costs more than remembering layouts is worth.
-        io.IniFilename = nullptr;
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        ImGui::StyleColorsDark();
-
-        if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX9_Init(dev))
+        if (!ImGui::GetCurrentContext())
         {
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            io.IniFilename = nullptr;
+            io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            ImGui::StyleColorsDark();
+        }
+
+        const bool windowReady = ImGui_ImplWin32_Init(g_hwnd);
+        if (!windowReady || !ImGui_ImplDX9_Init(dev))
+        {
+            if (windowReady) ImGui_ImplWin32_Shutdown();
             g_failed = true;
             WLOG_WARN("imgui: backend init failed, overlay disabled");
             return false;
@@ -117,9 +137,40 @@ namespace
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        for (int i = 0; i < g_panelCount; ++i)
+        // Opening tools should not open every registered module's windows. Keep each workspace
+        // opt-in, including owners such as Water that manage several windows themselves.
+        ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300.0f, 0.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("WarcraftXL tools", &g_open, ImGuiWindowFlags_AlwaysAutoResize))
         {
-            if (ImGui::Begin(g_panels[i].title)) g_panels[i].fn(g_panels[i].user);
+            ImGui::TextUnformatted("F9: tools | F8: depth preview (when enabled)");
+            ImGui::TextUnformatted("F11: enhanced/native renderer (when enabled)");
+            ImGui::TextUnformatted("F12: reload saved water, atmosphere, shadows and grading");
+            ImGui::Separator();
+            for (int i = 0; i < g_panelCount; ++i)
+            {
+                ImGui::PushID(i);
+                ImGui::Checkbox(g_panels[i].title, &g_panels[i].visible);
+                ImGui::PopID();
+            }
+        }
+        ImGui::End();
+
+        for (int i = 0; g_open && i < g_panelCount; ++i)
+        {
+            Panel& panel = g_panels[i];
+            if (!panel.visible) continue;
+            if (panel.ownsWindows)
+            {
+                panel.fn(panel.user);
+                continue;
+            }
+
+            if (panel.firstWidth > 0.0f || panel.firstHeight > 0.0f)
+                ImGui::SetNextWindowSize(ImVec2(panel.firstWidth, panel.firstHeight),
+                                         ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowPos(ImVec2(340.0f, 16.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin(panel.title, &panel.visible)) panel.fn(panel.user);
             ImGui::End();
         }
 
@@ -147,9 +198,11 @@ namespace
         if (g_ready) ImGui_ImplDX9_InvalidateDeviceObjects();
     }
 
-    void OnDeviceReset(void*, const void*)
+    void OnDeviceReset(void*, const void* args)
     {
-        if (g_ready) ImGui_ImplDX9_CreateDeviceObjects();
+        const auto* event = static_cast<const ev::DeviceResetArgs*>(args);
+        if (event && EnsureReady(static_cast<IDirect3DDevice9*>(event->device)))
+            ImGui_ImplDX9_CreateDeviceObjects();
     }
 
     void OnInput(void*, const void* args)
@@ -158,9 +211,10 @@ namespace
 
         // The toggle is read before anything else and never forwarded, so the key cannot also reach
         // the game. Handled on key-UP: a key-DOWN repeats while held and the overlay would strobe.
-        if (a->message == WM_KEYUP && static_cast<int>(a->wparam) == kToggleKey)
+        if ((a->message == WM_KEYDOWN || a->message == WM_KEYUP) &&
+            static_cast<int>(a->wparam) == kToggleKey)
         {
-            if (g_ready)
+            if (g_ready && a->message == WM_KEYUP)
             {
                 g_open = !g_open;
                 // The client hides and clips the cursor for mouselook. Releasing the clip is what
@@ -198,10 +252,16 @@ namespace
 
 namespace wxl::ui
 {
-    void AddPanel(const char* title, PanelFn fn, void* user)
+    void AddPanel(const char* title, PanelFn fn, void* user, float firstWidth, float firstHeight)
     {
         if (g_panelCount >= kMaxPanels || !title || !fn) return;
-        g_panels[g_panelCount++] = Panel{ title, fn, user };
+        g_panels[g_panelCount++] = Panel{ title, fn, user, firstWidth, firstHeight, false };
+    }
+
+    void AddWindowOwner(const char* name, PanelFn fn, void* user)
+    {
+        if (g_panelCount >= kMaxPanels || !name || !fn) return;
+        g_panels[g_panelCount++] = Panel{ name, fn, user, 0.0f, 0.0f, true };
     }
 
     bool IsOpen() { return g_open; }

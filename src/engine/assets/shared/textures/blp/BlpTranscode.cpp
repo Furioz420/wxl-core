@@ -305,7 +305,8 @@ namespace wxl::modern::assets::textures::blp
                     const uint32_t rRange = rMax - rMin;
                     const uint32_t gRange = gMax - gMin;
                     const uint32_t bRange = bMax - bMin;
-                    const uint32_t score = std::max({ rRange, gRange, bRange }) * static_cast<uint32_t>(std::min<uint64_t>(total, 0xffff));
+                    const uint32_t widest = (std::max)(rRange, (std::max)(gRange, bRange));
+                    const uint32_t score = widest * static_cast<uint32_t>(std::min<uint64_t>(total, 0xffff));
                     if (score > bestScore)
                     {
                         best = i;

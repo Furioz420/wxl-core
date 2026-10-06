@@ -69,6 +69,41 @@ namespace wxl::game::script
     using InterfaceLoadFn = off::FrameXMLCreateFramesFn;
 
     /**
+     * @brief Reads the live script state.
+     * @return The state, or null before the script engine has been brought up.
+     */
+    inline void* CurrentState()
+    { return Native<off::FrameScriptGetContextFn>(off::kFrameScriptGetContext)(); }
+
+    /**
+     * @brief Loads and runs a chunk on the live state.
+     * @param source     Chunk text.
+     * @param chunkName  What the chunk is called if it raises an error.
+     * @param taintName  Owner recorded for the duration of the call; null runs it as the engine's own.
+     */
+    inline void Execute(const char* source, const char* chunkName, const char* taintName = nullptr)
+    {
+        Native<off::FrameScriptExecuteFn>(off::kFrameScriptExecute)(source, chunkName, taintName);
+    }
+
+    /**
+     * @brief Declares a console variable, so a setting survives the script state being rebuilt.
+     * @param name          Variable name, as the console and the script side see it.
+     * @param defaultValue  Value it takes the first time it is declared.
+     * @param archive       Whether the value is written back to the saved configuration on exit.
+     * @return The variable, or null if @p name or @p defaultValue was empty.
+     */
+    inline void* RegisterCVar(const char* name, const char* defaultValue, bool archive = true)
+    {
+        constexpr uint32_t kNoFlags = 0;
+        constexpr int      kDeclaredByCode = 1;
+        constexpr uint32_t kNoUserData = 0;
+        return Native<off::CVarRegisterFn>(off::kCVarRegister)(
+            name, nullptr, kNoFlags, defaultValue, nullptr, off::kCVarCategoryDefault,
+            kDeclaredByCode, kNoUserData, archive ? 1 : 0);
+    }
+
+    /**
      * @brief Counts the values passed to the call.
      * @param state  Script state the call arrived on.
      * @return How many, including the frame for a method call.
@@ -108,8 +143,8 @@ namespace wxl::game::script
      * @return The text, or null when it is not convertible. It belongs to the script state and is only
      *         valid until the call returns -- copy anything kept.
      */
-    inline const char* ToString(void* state, int index)
-    { return Native<off::LuaToStringFn>(off::kLuaToString)(state, index, nullptr); }
+    inline const char* ToString(void* state, int index, size_t* length = nullptr)
+    { return Native<off::LuaToStringFn>(off::kLuaToString)(state, index, length); }
 
     /**
      * @brief Reads an argument as Lua truth.
@@ -171,6 +206,10 @@ namespace wxl::game::script
     inline void PushBoolean(void* state, bool value)
     { Native<off::LuaPushBooleanFn>(off::kLuaPushBoolean)(state, value ? 1 : 0); }
 
+    /** Pushes nil as a return value. */
+    inline void PushNil(void* state)
+    { Native<off::LuaPushNilFn>(off::kLuaPushNil)(state); }
+
     /**
      * @brief Raises a script error, the way every stock binding reports a bad argument.
      * @param state   Script state.
@@ -218,10 +257,6 @@ namespace wxl::game::script
      */
     inline void SetTop(void* state, int index)
     { Native<off::LuaSetTopFn>(off::kLuaSetTop)(state, index); }
-
-    /// Pushes nil.
-    inline void PushNil(void* state)
-    { Native<off::LuaPushNilFn>(off::kLuaPushNil)(state); }
 
     /// Pushes a copy of the value at @p index.
     inline void PushValue(void* state, int index)
@@ -376,20 +411,6 @@ namespace wxl::game::script
     inline void* Context()
     { return Native<off::FrameScriptGetContextFn>(off::kFrameScriptGetContext)(); }
 
-    /**
-     * @brief Compiles and runs a chunk of script source on the active context.
-     * @param source     Chunk text, NUL terminated.
-     * @param chunkName  Name a compile or runtime error inside it is reported against.
-     *
-     * THE STATE IS NOT PASSED: the engine's entry reads the active context itself. Its second
-     * argument is the chunk name and its third the taint source, which is left null so the chunk
-     * counts as the client's own rather than an addon's -- what the client passes for compat.lua.
-     *
-     * Nothing is returned: a compile or runtime failure is reported through the client's own script
-     * error path, not to the caller. The call is stack-neutral either way.
-     */
-    inline void Execute(const char* source, const char* chunkName)
-    { Native<off::FrameScriptExecuteFn>(off::kFrameScriptExecute)(source, chunkName, nullptr); }
     /**
      * @brief Calls a function already on the stack, under its arguments.
      * @param state         Script state.

@@ -35,6 +35,13 @@ namespace wxl::offsets::engine::sky
     /// vec3 in that block: direction of the active celestial light, world space -- the same vector
     /// the engine hands its own model lighting every frame.
     constexpr uintptr_t kInfoLightDir = 0x19C;
+    // Visible celestial billboard positions, separate from model-light direction.
+    // 0x007F2962/0x007F2979 initialize these with sunCenter.blp/moon.blp;
+    // 0x007F0B4D/0x007F0B57 submit them to the billboard renderer.
+    // 0x007EFAE0 selects the primary body and subtracts the sky origin.
+    constexpr uintptr_t kInfoSkyOrigin = 0x18;
+    constexpr uintptr_t kInfoSunPosition = 0x328;
+    constexpr uintptr_t kInfoMoonPosition = 0x348;
     /// float in that block: how far the day has run, 0 at its start through 1 at its end. The
     /// engine keys its own colour tables in half-minutes and reaches them by scaling this value
     /// by kDayHalfMinutes -- which is the unit the retail per-time light rows are keyed in too,

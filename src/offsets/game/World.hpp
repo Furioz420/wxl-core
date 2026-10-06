@@ -180,7 +180,7 @@ namespace wxl::offsets::game::world
     using GetScreenCoordinatesFn = int(__fastcall*)(void* worldFrame, void* unusedEdx,
                                                     const float* worldPos, float* outScreen,
                                                     uint32_t* clipFlags);
-    // UI coordinate multipliers used by Blizzard's world-space projection conversion.
+    // Adjacent UI texture-coordinate alpha multipliers. These are not viewport/aspect values.
     constexpr uintptr_t kUiTexCoordAlphaMultiplier1 = 0x00AC0CB4;
     constexpr uintptr_t kUiTexCoordAlphaMultiplier3 = 0x00AC0CBC;
     // CGWorldFrame::SetupDefaultAction refreshes its hit-test point from the active input
@@ -460,6 +460,12 @@ namespace wxl::offsets::game::world
     /// The graphics-preset application - hooking it lets an extension define its own quality tiers
     /// rather than fighting the client's. __cdecl, caller-cleaned.
     constexpr uintptr_t kParamDefaultsApply                = 0x0078E1A0;
+    /// Validates and applies extShadowQuality. Quality zero selects the legacy precomputed-terrain
+    /// shadow mode; callers may intercept this callback to reject or normalize unsupported modes.
+    /// __cdecl(cvar, callbackData, requestedValue), caller-cleaned.
+    constexpr uintptr_t kExtShadowQualityCallback          = 0x0078DCB0;
+    using ParamCVarCallbackFn = int(__cdecl*)(void* cvar, void* callbackData,
+                                              const char* requestedValue);
     /// Where every world-quality CVar and its change callback are registered - an extension can add its
     /// own world CVars into the same table, or capture the callback pointers. __cdecl, caller-cleaned.
     constexpr uintptr_t kParamInitialize                   = 0x0078E400;

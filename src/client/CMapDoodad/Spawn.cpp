@@ -27,6 +27,12 @@ namespace
 
     dd::SpawnFromMDDFFn g_origDoodadSpawn = nullptr;
 
+    void EmitDoodadSpawn(void* doodad, const char* modelName)
+    {
+        ev::DoodadSpawnArgs a{ doodad, modelName };
+        ev::Emit(ev::Event::OnDoodadSpawn, &a);
+    }
+
     /**
      * @brief Detours doodad spawn, emitting OnDoodadSpawn with the placement the native call built.
      * @param modelName   doodad model name.
@@ -37,8 +43,7 @@ namespace
     void* __cdecl hkDoodadSpawn(const char* modelName, void* mddf, void* tileOrigin)
     {
         void* doodad = g_origDoodadSpawn(modelName, mddf, tileOrigin);
-        ev::DoodadSpawnArgs a{ doodad };
-        ev::Emit(ev::Event::OnDoodadSpawn, &a);
+        EmitDoodadSpawn(doodad, modelName);
         return doodad;
     }
 

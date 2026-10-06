@@ -27,6 +27,20 @@ namespace wxl::offsets::engine::gx
     constexpr uintptr_t kGxDevicePtr    = 0x00C5DF88; // -> graphics device object
     constexpr size_t    kD3DDeviceField = 0x397C;     // graphics device -> IDirect3DDevice9*
 
+    // Engine draw dispatcher (__thiscall(device, primitiveBatch, indexed), ret 8). Before issuing
+    // DrawPrimitive/DrawIndexedPrimitive it derives the base vertex by dividing the currently bound
+    // vertex-buffer byte size by its stride. Modern or failed model uploads can leave a live buffer
+    // wrapper with a zero stride; the stock client performs the division unguarded at 0x006A366B.
+    constexpr uintptr_t kDeviceDraw                 = 0x006A3620;
+    constexpr size_t    kDeviceDrawUserMemory       = 0x0224; // nonzero: no bound-VB division
+    constexpr size_t    kDeviceCurrentVertexBuffer  = 0x2870; // -> engine VB wrapper
+    constexpr size_t    kDeviceDrawSceneActive      = 0x0F58; // stock outer draw gate
+    constexpr size_t    kDeviceDrawSuppressed       = 0x0F5C; // stock outer draw gate
+    constexpr size_t    kVertexBufferStride         = 0x000C;
+    constexpr size_t    kVertexBufferByteSize       = 0x0018;
+    using GxDeviceDrawFn = void(__fastcall*)(void* device, void* edx, int* primitiveBatch,
+                                             int indexed);
+
     // Cached render-target surfaces on the graphics-device object.
     constexpr size_t    kBackBufferField   = 0x3B3C; // cached back-buffer surface
     constexpr size_t    kDepthSurfaceField = 0x3B40; // cached world depth surface
@@ -189,7 +203,8 @@ namespace wxl::offsets::engine::gx
     // CGxBatch::startIndex is 32 bits here, while the M2 draw that filled it read the submesh's start
     // through a 16-bit field. This is the first place on the path where the full value fits.
     constexpr uintptr_t kGxDeviceDraw = 0x006A3620;
-    using GxDeviceDrawFn = void(__fastcall*)(void* device, void* edx, uint32_t* batch, int indexed);
+    // Unsigned view of the same native batch ABI; keep the legacy signed hook typedef above.
+    using GxDeviceDrawUnsignedFn = void(__fastcall*)(void* device, void* edx, uint32_t* batch, int indexed);
     /// The draw descriptor the entry above consumes: 0x10 bytes, built on the M2 draw's own stack.
     constexpr size_t kGxBatchPrimType   = 0x00; // uint32
     constexpr size_t kGxBatchStartIndex = 0x04; // uint32 -- the one wide field on the path
@@ -257,10 +272,21 @@ namespace wxl::offsets::engine::gx
     constexpr uintptr_t kGxTexSetWrap = 0x00681450;
     using GxTexSetWrapFn = void(__cdecl*)(void* gxTex, int wrapU, int wrapV);
 
-    // Central texture-data upload to the device (deviceTex, x, y, x2, y2, flag). Full-surface uploads
-    // pass (tex, 0, 0, width, height, 1), so width = x2 - x and height = y2 - y.
+    // Central texture-data upload to the device (texture, x, y, x2, y2, flag). Full-surface uploads
+    // pass (texture, 0, 0, width, height, 1); sub-rectangle uploads use the same six-argument contract.
     constexpr uintptr_t kTextureUpdate = 0x00681F20;
-    using TextureUpdateFn = void(__cdecl*)(void* deviceTex, int x, int y, int x2, int y2, int flag);
+    using TextureUpdateFn =
+        void(__cdecl*)(void* texture, int x, int y, int x2, int y2, int flag);
+
+    // CBLPFile::LockChain2 (thiscall, ret 0x14). The stock texture loader passes
+    // &kMipTablePtr as chainOwner when rebuilding the process-wide mip scratch.
+    // Clear that table before this routine repopulates it, never after
+    // GxTexUpdate: GxTexUpdate only queues/marks a later device update.
+    constexpr uintptr_t kBlpLockChain2 = 0x006AFFD0;
+    using BlpLockChain2Fn = int(__fastcall*)(void* blp, void* edx,
+                                             uint32_t source, int format,
+                                             uint32_t** chainOwner,
+                                             uint32_t firstMip, int direct);
 
     // Central by-name texture create API (__cdecl). The single choke point all texture requests funnel
     // through; fires on every reference (returns the cached handle on a hit), so it sees the name of each
@@ -297,7 +323,7 @@ namespace wxl::offsets::engine::gx
     constexpr uint32_t  kMipScratchWideEdge  = 0x800;    // widened capacity (2048 any-encoding chains)
 
     // Per-frame liquid render pass loop (this-in-ECX). Brackets every visible liquid instance of one pass;
-    // both passes route through it (passType 0 main, 1 secondary). Runs late in the frame, after the liquid
+    // both buckets route through it (passType 0 or 1; either may contain world water). Runs after the liquid
     // textures are bound and the render queues flush, so the wave/ripple animation is already applied.
     // ECX is the liquid material-settings bank: an array of LiquidPassEntry indexed by passType.
     constexpr uintptr_t kLiquidRenderPass = 0x008A2240;
