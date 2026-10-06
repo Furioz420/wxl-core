@@ -21,12 +21,18 @@
 // INTERNAL to the core. The master per-frame pump and the timing globals it updates each frame.
 namespace wxl::offsets::engine::frame
 {
-    // Master per-frame pump: runs once per frame in every state (menu, login, world), near the top of
-    // the frame before the world render and before EndScene. The natural OnUpdate anchor.
-    constexpr uintptr_t kFramePump = 0x0047DCA0;
-    using FramePumpFn = void(__cdecl*)();
+    // Frame-time tick: the one writer of the frame delta and the frame timestamp, which it receives
+    // as arguments. Everything in the client that asks "how long was the last frame" reads what this
+    // stores, so it runs exactly once per frame by construction -- a second call would corrupt the
+    // client's own timing before it corrupted ours. That makes it the OnUpdate anchor.
+    //
+    // __cdecl, two stack args, verified at the prologue ([ebp+8] float, [ebp+0xc] int) and at the
+    // bare `ret` that ends it.
+    constexpr uintptr_t kFramePump = 0x0077ECB0;
+    using FramePumpFn = void(__cdecl*)(float deltaSeconds, uint32_t frameTimeMs);
 
-    // Frame timing the pump refreshes: delta time in seconds and the frame timestamp in milliseconds.
+    // The two globals it stores into, kept because a great deal of the client reads them and they
+    // are the only place a late caller can recover the current frame's timing from.
     constexpr uintptr_t kDeltaSeconds = 0x00CD76A0; // float
     constexpr uintptr_t kFrameTimeMs  = 0x00CD76AC; // u32
 }

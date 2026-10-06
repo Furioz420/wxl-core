@@ -36,14 +36,27 @@ namespace wxl::offsets::engine::sound
     // Non-zero once the sound system is initialized.
     constexpr uintptr_t kSoundActiveFlag = 0x00D43814;
 
+    // SoundKitID playback entry: resolves the given SoundKitID against the loaded SoundEntriesRec index
+    // and, on a hit with a populated file-variant list, plays it. Covers spell/creature/UI
+    // SoundKitID-driven playback. Returns 5 when the id is not found, 6 when the record has no file
+    // variant for the current locale/gender -- both before any file I/O is attempted.
+    constexpr uintptr_t kPlaySoundKit = 0x004C6A40;
+    using PlaySoundKitFn = int(__cdecl*)(int soundKitId, int p2, int p3, int* p4, int p5,
+                                          uint32_t* p6, uint32_t p7, int p8);
+
+    // Native ItemDisplayInfo -> ItemGroupSounds action player. Action 0 is pickup and action 1 is
+    // putdown/equip. The variant bridge uses this only after the retail display row is resolved.
+    constexpr uintptr_t kPlayItemDisplaySound = 0x004D0090;
+    using PlayItemDisplaySoundFn = void(__cdecl*)(uint32_t action, uint32_t displayId);
+
     // Sound-group array pointer; the first group's field at +0x08 holds the live master-volume float.
     constexpr uintptr_t kSoundGroupArrayPtr  = 0x00D438FC;
     constexpr size_t    kOffGroupMasterVolume = 0x08;
 
     // --- typed view over a sound-group record ---
     // The constants above are the curated landmarks; this struct gives named, typed access to the same
-    // field, with the member offset checked against the constant at compile time. Only the RE'd field is
-    // named; the lead-in is explicit padding.
+    // field, with the member offset checked against the constant at compile time. Only the field of
+    // interest is named; the lead-in is explicit padding.
 #pragma pack(push, 1)
     /** @brief Sound-group record (an element of the kSoundGroupArrayPtr target). */
     struct SoundGroup

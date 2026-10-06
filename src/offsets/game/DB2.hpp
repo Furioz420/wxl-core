@@ -23,6 +23,55 @@
 // each replaced table. Modules never include this; they use wxl::game / wxl::events.
 namespace wxl::offsets::game::db2
 {
+    // Generic row accessor shared by the client's data tables: yields the record for an id, or null
+    // when the table carries no such row. ECX = its ID-index subobject, NOT storage base.
+    // Build 12340 reads min/max/index at ECX-8 / ECX-12 / ECX+8 respectively.
+    constexpr uintptr_t kClientDbGetRow = 0x0065C290;
+    using ClientDbGetRowFn = void*(__thiscall*)(void* indexSubobject, uint32_t id);
+
+    // Animation table: what an animation id means, and what to play instead when a model lacks it.
+    namespace animationdata
+    {
+        constexpr uintptr_t kStorageObject = 0x00AD30C8;
+        // Verified against Unit.ResolveModelAnimation's inlined AnimationData lookup.
+        constexpr uintptr_t kRowIndexObject = kStorageObject + 0x18;
+        static_assert(kRowIndexObject - 8 == 0x00AD30D8);
+        static_assert(kRowIndexObject - 12 == 0x00AD30D4);
+        static_assert(kRowIndexObject + 8 == 0x00AD30E8);
+
+        // Highest id the native resolver accepts. Its fallback walk marks visited ids in a
+        // stack-allocated array indexed by the id itself, so the bound is that buffer's size rather
+        // than anything about the table: an id above it is refused before the walk starts, even when
+        // the model carries the sequence. Never hand the native entries an id past this.
+        constexpr uint32_t kLastStockId = 505;
+
+#pragma pack(push, 1)
+        /** @brief One animation row: its identity, its classification bits, and its fallback id. */
+        struct Row
+        {
+            uint32_t    id;
+            const char* name;
+            uint32_t    weaponFlags;
+            uint32_t    bodyFlags;
+            uint32_t    flags;
+            uint32_t    fallback;      // id to play instead when the model lacks this one (0 = none)
+            uint32_t    behaviorId;
+            uint32_t    behaviorTier;
+        };
+#pragma pack(pop)
+        static_assert(sizeof(Row) == 32, "AnimationData row stride");
+    }
+
+    // Item DBC. Several hot consumers read this ID table inline instead of calling the generic accessor.
+    namespace item
+    {
+        constexpr uintptr_t kStorageObject = 0x00AD3D4C;
+        constexpr uintptr_t kMaxId         = 0x00AD3D58;
+        constexpr uintptr_t kMinId         = 0x00AD3D5C;
+        constexpr uintptr_t kIdTable       = 0x00AD3D6C;
+        constexpr size_t    kRecordSize    = 32;
+    }
+
     // -------------------------------------------------------------------------
     // Map storage. The engine compacts each on-disk map row into a fixed-size in-memory record and
     // indexes it by (id - minId). The override merges modern map rows into this storage in place.
@@ -62,15 +111,55 @@ namespace wxl::offsets::game::db2
     }
 
     // -------------------------------------------------------------------------
+    // CreatureModelData DBC. Where a displayed model's FILE lives: one string per row and nothing
+    // else that names an asset, which is what makes repointing a model a single pointer write rather
+    // than a row rebuild. The client asserts the shape at load and refuses the file otherwise, so a
+    // replacement array must keep both numbers.
+    // -------------------------------------------------------------------------
+    namespace creaturemodeldata
+    {
+        constexpr uintptr_t kStorageObject = 0x00AD3500; // storage instance (g_creatureModelDataDB)
+        constexpr uintptr_t kRecordCount   = 0x00AD3508; // storage +0x08
+        constexpr uintptr_t kRecordData    = 0x00AD351C; // storage +0x1C, record array base
+        constexpr uint32_t  kColumnCount   = 0x1C;       // 28, asserted by Load
+        constexpr uint32_t  kRowSize       = 0x70;       // 112, asserted by Load
+        // The row's ONLY string: every other column is a raw int. Read relocates just this one by the
+        // string block base, and points it at an empty-string constant when there is no block.
+        constexpr size_t    kOffModelName  = 0x08;       // char* model file path
+    }
+
+    // -------------------------------------------------------------------------
+    // CreatureDisplayInfo DBC. The indirection between a display id and the model row above it.
+    // -------------------------------------------------------------------------
+    namespace creaturedisplayinfo
+    {
+        constexpr uintptr_t kStorageObject = 0x00AD34B8; // storage instance (g_creatureDisplayInfoDB)
+        constexpr uintptr_t kRecordCount   = 0x00AD34C0; // storage +0x08
+        constexpr uintptr_t kRecordData    = 0x00AD34D4; // storage +0x1C, record array base
+        constexpr uint32_t  kColumnCount   = 0x10;       // 16, asserted by Load
+        constexpr uint32_t  kRowSize       = 0x40;       // 64, asserted by Load
+        constexpr size_t    kOffModelId    = 0x04;       // u32 CreatureModelData id
+    }
+
+    // -------------------------------------------------------------------------
     // ChrRaces DBC. Compacted storage indexed by (id - minId). The ClientPrefix field at +0x18 is
-    // a 4-char race code (e.g. "Hum", "Orc") used to build model paths.
+    // a POINTER to a NUL-terminated 2-char race code string (e.g. "Hu", "Or") used to build model
+    // paths -- dereference it, don't read inline bytes.
+    //
+    // Corrected 2026-08-14, twice: first documented as an embedded NUL-terminated char[4] ("Hum",
+    // "Orc") -- wrong on both the width (it's 2 chars) and the "embedded" part. Verified via fresh
+    // disassembly of sub_4e7800 (the native head-model path builder, `CGItemComponentPathBuilder::
+    // BuildItemHeadObjectComponentPath`): `mov eax, [chrRec+0x18]` loads a pointer, then a
+    // byte-copy loop reads `*eax`, `*(eax+1)`, ... until a NUL. So: `*(const char**)(chrRec+0x18)`
+    // gives a normal, already-NUL-terminated C string -- one dereference, not raw bytes at the
+    // offset itself.
     // -------------------------------------------------------------------------
     namespace chrraces
     {
         constexpr uintptr_t kMinId          = 0x00AD3438; // i32 minimum race id in the table
         constexpr uintptr_t kMaxId          = 0x00AD3434; // i32 maximum race id
         constexpr uintptr_t kIdTable        = 0x00AD3448; // record* table, indexed by (id - minId)
-        constexpr size_t    kOffRecordPrefix= 0x18;       // char[4] race client prefix (e.g. "Hum")
+        constexpr size_t    kOffRecordPrefix= 0x18;       // char* -> NUL-terminated 2-char race code (e.g. "Hu")
     }
 
     // -------------------------------------------------------------------------
@@ -80,13 +169,19 @@ namespace wxl::offsets::game::db2
     namespace itemdisplayinfo
     {
         constexpr uintptr_t kStorageObject  = 0x00AD3DDC; // storage instance
-        // sub_4cfd90: thiscall(ecx=storageObj, displayId, outBuf); fills outBuf with the 256-byte
+        constexpr uintptr_t kMaxId          = 0x00AD3DE8;
+        constexpr uintptr_t kMinId          = 0x00AD3DEC;
+        constexpr uintptr_t kIdTable        = 0x00AD3DFC;
+        // kLookup: thiscall(ecx=storageObj, displayId, outBuf); fills outBuf with the 256-byte
         // record copy (field pointers point into the live DBC string block); returns non-zero if found.
         constexpr uintptr_t kLookup         = 0x004CFD90;
         using LookupFn = uint32_t (__fastcall*)(void* storageObj, void* edx, uint32_t displayId, void* outBuf);
 
         // Field offsets within the resolved record pointer (byte offsets from the record base).
-        constexpr size_t kOffModel1     = 0x04; // char* primary model filename (no path, no extension)
+        // Corrected 2026-08-14: Model1/Model2 DO include their own extension (".mdx") -- confirmed
+        // in-client (a consumer that appended its own extension without stripping the existing one
+        // produced a double-extensioned path). Previously documented as "no extension" here, wrong.
+        constexpr size_t kOffModel1     = 0x04; // char* primary model filename (no path, WITH extension)
         constexpr size_t kOffModel2     = 0x08; // char* secondary model filename (left/right variant)
         constexpr size_t kOffTex1       = 0x0C; // char* primary texture name
         constexpr size_t kOffTex2       = 0x10; // char* secondary texture name

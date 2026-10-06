@@ -27,9 +27,54 @@ namespace wxl::offsets::engine::gx
     constexpr uintptr_t kGxDevicePtr    = 0x00C5DF88; // -> graphics device object
     constexpr size_t    kD3DDeviceField = 0x397C;     // graphics device -> IDirect3DDevice9*
 
+    // Engine draw dispatcher (__thiscall(device, primitiveBatch, indexed), ret 8). Before issuing
+    // DrawPrimitive/DrawIndexedPrimitive it derives the base vertex by dividing the currently bound
+    // vertex-buffer byte size by its stride. Modern or failed model uploads can leave a live buffer
+    // wrapper with a zero stride; the stock client performs the division unguarded at 0x006A366B.
+    constexpr uintptr_t kDeviceDraw                 = 0x006A3620;
+    constexpr size_t    kDeviceDrawUserMemory       = 0x0224; // nonzero: no bound-VB division
+    constexpr size_t    kDeviceCurrentVertexBuffer  = 0x2870; // -> engine VB wrapper
+    constexpr size_t    kDeviceDrawSceneActive      = 0x0F58; // stock outer draw gate
+    constexpr size_t    kDeviceDrawSuppressed       = 0x0F5C; // stock outer draw gate
+    constexpr size_t    kVertexBufferStride         = 0x000C;
+    constexpr size_t    kVertexBufferByteSize       = 0x0018;
+    using GxDeviceDrawFn = void(__fastcall*)(void* device, void* edx, int* primitiveBatch,
+                                             int indexed);
+
     // Cached render-target surfaces on the graphics-device object.
     constexpr size_t    kBackBufferField   = 0x3B3C; // cached back-buffer surface
     constexpr size_t    kDepthSurfaceField = 0x3B40; // cached world depth surface
+
+    // --- blend-state factor tables ---
+    // Two parallel arrays of API blend factors, one entry per blend state, read by the single site that
+    // pushes blend state to the hardware -- one instruction per table, each with the table's address as
+    // an absolute displacement. That makes the pair RELOCATABLE: copy them somewhere larger, patch the
+    // two displacements, and the engine reads the wider tables without knowing it. Which is how a blend
+    // state the stock table has no room for gets one.
+    constexpr uintptr_t kBlendSrcFactors  = 0x00A2F964;
+    constexpr uintptr_t kBlendDstFactors  = 0x00A2F994;
+    constexpr uint32_t  kBlendStateCount  = 12;       // entries in the stock tables
+    constexpr uintptr_t kBlendSrcReadDisp = 0x006A4D94; // displacement operand naming the src table
+    constexpr uintptr_t kBlendDstReadDisp = 0x006A4DBD; // ... and the dst table
+
+    // API blend factors as the tables spell them.
+    enum : uint32_t
+    {
+        kD3dBlendZero        = 1,
+        kD3dBlendOne         = 2,
+        kD3dBlendSrcColor    = 3,
+        kD3dBlendInvSrcColor = 4,
+        kD3dBlendSrcAlpha    = 5,
+        kD3dBlendInvSrcAlpha = 6,
+        kD3dBlendDestColor   = 9,
+        kD3dBlendInvDestColor = 10,
+    };
+
+    // States added past the stock count. The numbering continues the stock enum because the modern
+    // asset data numbers them that way -- these are the values a modern particle record already names,
+    // not identifiers of our invention.
+    constexpr uint32_t kBlendStateScreenAdd   = 12;   // inverse-dest-colour / one
+    constexpr uint32_t kBlendStatePremulAlpha = 13;   // one / inverse-src-alpha
 
     // Render-resolution rects on the graphics-device object. Each is a rect of 4 floats
     // {minX,minY,maxX,maxY}; min stays 0, so maxX/maxY hold the pixel width/height. curWindow is the live
@@ -47,6 +92,9 @@ namespace wxl::offsets::engine::gx
     constexpr size_t    kFormatHeight    = 0x1D4; // active format height (backbuffer px, unscaled)
     constexpr size_t    kViewportDirty   = 0xF6C; // set to 1 to force a viewport recompute from curWindow
     constexpr size_t    kRtOverrideField = 0x2918; // non-zero while an offscreen RT override is active (not the backbuffer pass)
+    // Master switches, one bit per rendering category, read by the device's master-enable check. Bit 8
+    // off is what makes the world scene clear to opaque black instead of the horizon colour.
+    constexpr size_t    kMasterEnableField = 0x2758;
     constexpr uintptr_t kDeviceSetDefWindow = 0x00684360; // resolution choke (create + every resize)
 
     // Engine render-target bind chokepoint: the world (and UI) bind their target through this method, which
@@ -61,10 +109,28 @@ namespace wxl::offsets::engine::gx
     // camera is not written to the world camera globals (they stay identity on the glue screens), so a
     // depth-using effect (ambient occlusion) on the glue screens has no matrix without capturing it here.
     constexpr unsigned  kGxSetProjectionSlot   = 0xA0 / 4;   // = 40, device projection-upload slot
+    constexpr unsigned  kGxSetViewSlot         = 0xA4 / 4;   // = 41, device view-upload slot
     using GxSetProjectionFn = void(__fastcall*)(void* self, void* edx, const void* proj16);
 
-    // CSimpleModelFFX::Render: the GLUE 3D-scene render callback -- the login / character-select model preview.
-    // It is the glue-side analogue of CGWorldFrame::RenderWorld (kWorldRenderFinalize): the engine defers every
+    // Where the device keeps the matrices those two slots upload, so they can be read back and
+    // restored. The per-frame world render saves both before drawing the world and uploads them again
+    // after, then refreshes the shader system -- the world render overwrites them and does not restore
+    // them, so anything calling it outside that wrapper has to bracket it the same way.
+    //
+    // The view is the top of a stack: the live index sits at kDeviceViewIndex and selects a slot of
+    // kDeviceViewStride bytes from kDeviceViewBase.
+    constexpr size_t    kDeviceProjection = 0x3E2 * 4;
+    constexpr size_t    kDeviceViewIndex  = 0x6BE * 4;
+    constexpr size_t    kDeviceViewBase   = 0x6C0 * 4;
+    constexpr size_t    kDeviceViewStride = 0x10 * 4;
+
+    // Re-derives the shader system's projection from the device. Called after the matrices are put
+    // back, since the shaders hold their own copy.
+    constexpr uintptr_t kShaderUpdateProjMatrix = 0x00872C10;
+    using ShaderUpdateProjMatrixFn = void(__cdecl*)();
+
+    // The GLUE 3D-scene render callback -- the login / character-select model preview.
+    // It is the glue-side analogue of the per-frame world render (kWorldRenderFinalize): the engine defers every
     // 3D render into a per-frame-object callback (there is no single global "3D done" point), so the world hook
     // covers the world and THIS hook covers the glue model. Hooked at its entry and the post-process boundary is
     // fired after the original returns (model rendered, glue UI not yet drawn). In-world it also runs for 3D UI
@@ -72,16 +138,90 @@ namespace wxl::offsets::engine::gx
     constexpr uintptr_t kSimpleModelFFXRender = 0x004E6190;
     using GlueModelRenderFn = void(__cdecl*)(void* frame);
 
+    // The glue model frame's script-method registration, the callback the metatable builder invokes.
+    // Detour it, let the stock methods register, then append: the frame types built on it -- including
+    // the glue screens' ModelFFX -- inherit whatever was added.
+    constexpr uintptr_t kSimpleModelRegisterMethods = 0x009603D0;
+    using RegisterScriptMethodsFn = void(__cdecl*)(void* target);
+
+    // The glue model frame's script type-id slot, zero until its first script method claims one from the
+    // global counter (engine::lua::kObjectTypeCounter). Resolving the invoked object goes through this id.
+    constexpr uintptr_t kSimpleModelTypeId = 0x00DCE428;
+
+    // Scene clear (flags, colour), forwarded to the device's own clear routine: flags bit 0 clears the
+    // colour target, bit 1 the depth buffer, so 3 clears both and 2 leaves the colour standing.
+    //
+    // Every glue 3D object's render opens with an unconditional colour+depth clear -- unconditional in
+    // the literal sense that only the model draw between them is guarded, not the clears. Anything
+    // painted into the frame beforehand is erased whatever that object turns out to render.
+    constexpr uintptr_t kGxSceneClear = 0x006813B0;
+    constexpr uint32_t  kSceneClearColor = 1;
+    constexpr uint32_t  kSceneClearDepth = 2;
+    using GxSceneClearFn = void(__cdecl*)(uint32_t flags, uint32_t colour);
+
     // M2 triangle-batch draw (this-in-ECX). The hook reads the current model so the per-draw event
     // can name which model is rendering.
     constexpr uintptr_t kDrawTriangleBatch      = 0x008203B0;
-    constexpr size_t    kDrawBatchCtxModelField = 0x60; // draw context -> current model
-    constexpr size_t    kDrawBatchCtxSectionField = 0x90; // draw context -> copied M2SkinSection
+    // Draw context -> the current INSTANCE, not the shared model: the draw reads its bone palette at
+    // +0x98 and reaches the file header through +0x2C -> +0x150. Anything that wants the model (a path,
+    // a registry lookup keyed on shared data) has to take that +0x2C step first; treating this pointer
+    // as the model reads whatever the instance happens to hold at the model's field offsets.
+    constexpr size_t    kDrawBatchCtxModelField = 0x60;
+    // draw context -> copied M2SkinSection. TRAP: both kDrawTriangleBatch and kDrawBatchDoodad refresh
+    // this field from the current batch record's own section (kM2ElementSectionField below) as the
+    // VERY FIRST thing they do, so a hook hung on either function's entry still sees the PREVIOUS
+    // batch's section here -- the draw context object is reused across every batch in a pass, so this
+    // is stale on every single call, never just occasionally. A caller that needs the section for the
+    // batch about to run (not the one that already ran) must read it fresh off the batch record itself
+    // via kDrawBatchCtxElementField + kM2ElementSectionField instead of this field.
+    constexpr size_t    kDrawBatchCtxSectionField = 0x90;
+    // The batched-doodad sibling of kDrawTriangleBatch above -- __thiscall(this, elements, indices),
+    // ret 8, called from the same per-frame sorted batch walk. Shares the identical draw-context shape
+    // (kDrawBatchCtxElementField/kDrawBatchCtxSectionField are the same fields this draw entry itself
+    // reads before negotiating a co-instance batch), so DrawBatchContext below describes both entries.
+    constexpr uintptr_t kDrawBatchDoodad          = 0x00820AE0;
+    constexpr size_t    kDrawBatchCtxElementField = 0x50; // draw context -> current M2Element/batch record
+    // M2Element/batch-record (what kDrawBatchCtxElementField points at) -> its own, always-current
+    // M2SkinSection*. The value kDrawTriangleBatch/kDrawBatchDoodad copy into kDrawBatchCtxSectionField
+    // on entry -- read it from here directly to see the batch about to run instead of the stale copy.
+    constexpr size_t    kM2ElementSectionField = 0x2C;
+    // M2Element/batch-record -> total requested co-instance count for this run. Read once by
+    // kDrawBatchDoodad's own entry (its total-work bound) and read AGAIN by CM2SceneRender::Draw's
+    // per-batch dispatch loop right after the call returns, to advance its sorted-index cursor past the
+    // whole run -- a caller that shrinks this field to issue several smaller native calls (each within
+    // the c31-based VS-constant budget) MUST restore it to the original value before returning, or
+    // Draw's cursor undershoots and re-visits the run's tail as a bogus second batch. Only the head
+    // M2Element of a run of >=2 same-batch-key elements carries a meaningful value here; every other
+    // element in the run has it unset, which is exactly why the restore is mandatory, not optional.
+    constexpr size_t    kM2ElementRunLengthField = 0x1C;
+
+    // The device-level draw every batch funnels through, one step below the vtable slot an extension
+    // may own: __thiscall(this, batch, indexed), ret 8. It reads the CGxBatch the M2 draw built and
+    // calls the indexed or non-indexed vtable entry.
+    //
+    // Worth owning rather than the vtable slot when what has to change is a value the batch carries:
+    // CGxBatch::startIndex is 32 bits here, while the M2 draw that filled it read the submesh's start
+    // through a 16-bit field. This is the first place on the path where the full value fits.
+    constexpr uintptr_t kGxDeviceDraw = 0x006A3620;
+    // Unsigned view of the same native batch ABI; keep the legacy signed hook typedef above.
+    using GxDeviceDrawUnsignedFn = void(__fastcall*)(void* device, void* edx, uint32_t* batch, int indexed);
+    /// The draw descriptor the entry above consumes: 0x10 bytes, built on the M2 draw's own stack.
+    constexpr size_t kGxBatchPrimType   = 0x00; // uint32
+    constexpr size_t kGxBatchStartIndex = 0x04; // uint32 -- the one wide field on the path
+    constexpr size_t kGxBatchIndexCount = 0x08; // uint32
+    constexpr size_t kGxBatchMinIndex   = 0x0C; // uint16
+    constexpr size_t kGxBatchMaxIndex   = 0x0E; // uint16
+    constexpr size_t kGxDeviceVertexStream = 0x2870; // -> the bound vertex stream buffer
+    constexpr size_t kGxBufStreamOffset    = 0x18;   // uint32, in bytes
+    constexpr size_t kGxBufStreamStride    = 0x0C;   // uint32
+    /// Non-zero selects a path that passes a base vertex of zero instead of deriving one, so the
+    /// stored offset is ignored there. Anything relying on that derivation has to check this first.
+    constexpr size_t kGxDeviceBaseVertexMode = 0x224;
 
     // --- typed views over the device objects ---
     // The constants above are the curated landmarks; these structs give named, typed access to the same
-    // fields, with every member offset checked against a constant at compile time. Only RE'd fields are
-    // named; the gaps are explicit padding. Pointers are 4 bytes on the 32-bit client. The graphics-device
+    // fields, with every member offset checked against a constant at compile time. Only confirmed fields
+    // are named; the gaps are explicit padding. Pointers are 4 bytes on the 32-bit client. The graphics-device
     // singleton pointer, the vtable indices, the function addresses, and the render-state ids stay as plain
     // constants: they are not struct fields.
 #pragma pack(push, 1)
@@ -98,14 +238,17 @@ namespace wxl::offsets::engine::gx
     static_assert(offsetof(GxDevice, backBuffer)   == kBackBufferField,  "GxDevice.backBuffer");
     static_assert(offsetof(GxDevice, depthSurface) == kDepthSurfaceField, "GxDevice.depthSurface");
 
-    /** @brief M2 triangle-batch draw context (this-in-ECX at kDrawTriangleBatch). */
+    /** @brief M2 triangle-batch draw context (this-in-ECX at kDrawTriangleBatch or kDrawBatchDoodad). */
     struct DrawBatchContext
     {
-        uint8_t  _pad00[kDrawBatchCtxModelField];
-        void*    model;            // kDrawBatchCtxModelField -> current model
+        uint8_t  _pad00[kDrawBatchCtxElementField];
+        void*    element;          // kDrawBatchCtxElementField -> current M2Element/batch record
+        uint8_t  _pad54[kDrawBatchCtxModelField - (kDrawBatchCtxElementField + sizeof(void*))];
+        void*    model;            // kDrawBatchCtxModelField -> current INSTANCE (see the note there)
         uint8_t  _pad64[kDrawBatchCtxSectionField - (kDrawBatchCtxModelField + sizeof(void*))];
         void*    section;          // kDrawBatchCtxSectionField -> copied M2SkinSection for this draw
     };
+    static_assert(offsetof(DrawBatchContext, element) == kDrawBatchCtxElementField, "DrawBatchContext.element");
     static_assert(offsetof(DrawBatchContext, model) == kDrawBatchCtxModelField, "DrawBatchContext.model");
     static_assert(offsetof(DrawBatchContext, section) == kDrawBatchCtxSectionField, "DrawBatchContext.section");
 #pragma pack(pop)
@@ -113,15 +256,37 @@ namespace wxl::offsets::engine::gx
     // World-frame finalize render callback, once per frame. Hook its entry and fire the event after the
     // original returns: world done, UI not yet started. The world -> UI boundary / post-fx slot. The
     // epilogue-anchor address is mid-epilogue, not a hookable entry; kept only as a landmark.
+    // The world render pass alone: viewport, scene draw, and the passes around it. Its caller
+    // (kWorldRenderFinalize) pairs it with the world frame's own per-frame update, which is a different
+    // kind of work -- free lists, effect managers, pending portraits, all belonging to a world frame the engine
+    // built. A scene drawn for a frame the engine did not build wants this half and not that one.
+    constexpr uintptr_t kWorldOnRender = 0x004F8EA0;
+    using WorldOnRenderFn = void(__fastcall*)(void* worldFrame, void* edx);
+
     constexpr uintptr_t kWorldRenderFinalize = 0x004FAF90;
     constexpr uintptr_t kWorldRenderEpilogueAnchor = 0x004FB074; // landmark only, do NOT hook
     using WorldRenderFinalizeFn = void(__cdecl*)(void* worldFrame);
 
-    // Central texture-data upload to the device (deviceTex, x, y, x2, y2, flag). Full-surface uploads pass
-    // (tex, 0, 0, width, height, 1), so width = x2 - x, height = y2 - y. The single __cdecl choke point all
-    // upload paths funnel through.
+    // Sets a texture object's wrap mode (tex, wrapU, wrapV): 1 = repeat, 0 = clamp. The WMO batch draws
+    // derive both flags from the material record before binding stage 0.
+    constexpr uintptr_t kGxTexSetWrap = 0x00681450;
+    using GxTexSetWrapFn = void(__cdecl*)(void* gxTex, int wrapU, int wrapV);
+
+    // Central texture-data upload to the device (texture, x, y, x2, y2, flag). Full-surface uploads
+    // pass (texture, 0, 0, width, height, 1); sub-rectangle uploads use the same six-argument contract.
     constexpr uintptr_t kTextureUpdate = 0x00681F20;
-    using TextureUpdateFn = void(__cdecl*)(void* deviceTex, int x, int y, int x2, int y2, int flag);
+    using TextureUpdateFn =
+        void(__cdecl*)(void* texture, int x, int y, int x2, int y2, int flag);
+
+    // CBLPFile::LockChain2 (thiscall, ret 0x14). The stock texture loader passes
+    // &kMipTablePtr as chainOwner when rebuilding the process-wide mip scratch.
+    // Clear that table before this routine repopulates it, never after
+    // GxTexUpdate: GxTexUpdate only queues/marks a later device update.
+    constexpr uintptr_t kBlpLockChain2 = 0x006AFFD0;
+    using BlpLockChain2Fn = int(__fastcall*)(void* blp, void* edx,
+                                             uint32_t source, int format,
+                                             uint32_t** chainOwner,
+                                             uint32_t firstMip, int direct);
 
     // Central by-name texture create API (__cdecl). The single choke point all texture requests funnel
     // through; fires on every reference (returns the cached handle on a hit), so it sees the name of each
@@ -138,15 +303,27 @@ namespace wxl::offsets::engine::gx
     constexpr uintptr_t kMipTablePtr   = 0x00B49C90;
     constexpr uintptr_t kMipTableValid = 0x00B49C94; // nonzero while the table is live (gates a reload)
     constexpr size_t    kMipTableSlots = 16;         // upper bound on mip levels (real count <= 13)
-    // The table is filled per build (CBLPFile_LockChain2 writes kMipTablePtr[mip] = alias) only for mip
+    // The table is filled per build (the mip-chain lock writes kMipTablePtr[mip] = alias) only for mip
     // levels with a nonzero size, so a truncated mip chain (common in custom-map BLPs) under-fills it and
-    // leaves a previous build's freed alias in a high slot. The upload (CGxDeviceD3d__ITexUpload) walks mips
-    // by header dimensions and would read that stale slot and fault (the 0x40cb6a UAF on a cold custom-map
-    // login). Its per-mip blit is guarded by "source != 0", so clearing the table after each upload makes an
-    // under-filled build's high slots read 0 and get skipped.
+    // leaves a previous build's freed alias in a high slot. The upload walks mips by header dimensions and
+    // would read that stale slot and fault (a use-after-free on a cold custom-map login). Its per-mip blit
+    // is guarded by "source != 0", so clearing the table after each upload makes an under-filled build's
+    // high slots read 0 and get skipped.
+
+    // The buffer behind kMipTablePtr is allocated ONCE at boot sized for a 32-bpp
+    // 0x400 x 0x400 mip chain (~5.59 MB), and every synchronous mip fill (atlas reload, self-heal, TGA)
+    // memcpys the texture's decoded chain into it. A 2048 DXT5 chain already
+    // exceeds that capacity by a few bytes, so any texture wider than 1024 corrupts the heap the first
+    // time it takes the sync path. The two addresses below are the width/height push imm32 operands of
+    // the boot-time size computation; widening both to 0x800 (32-bpp 2048 chain, ~22.4 MB) makes every
+    // chain of any encoding up to 2048 fit.
+    constexpr uintptr_t kMipScratchDimHImm = 0x004B7F8D; // push imm32 operand, height arg
+    constexpr uintptr_t kMipScratchDimWImm = 0x004B7F92; // push imm32 operand, width arg
+    constexpr uint32_t  kMipScratchStockEdge = 0x400;    // shipped operand value at both sites
+    constexpr uint32_t  kMipScratchWideEdge  = 0x800;    // widened capacity (2048 any-encoding chains)
 
     // Per-frame liquid render pass loop (this-in-ECX). Brackets every visible liquid instance of one pass;
-    // both passes route through it (passType 0 main, 1 secondary). Runs late in the frame, after the liquid
+    // both buckets route through it (passType 0 or 1; either may contain world water). Runs after the liquid
     // textures are bound and the render queues flush, so the wave/ripple animation is already applied.
     // ECX is the liquid material-settings bank: an array of LiquidPassEntry indexed by passType.
     constexpr uintptr_t kLiquidRenderPass = 0x008A2240;
@@ -183,12 +360,16 @@ namespace wxl::offsets::engine::gx
         constexpr unsigned kBeginScene             = 41;
         constexpr unsigned kEndScene               = 42;
         constexpr unsigned kClear                  = 43;
+        constexpr unsigned kSetTransform           = 44;
+        constexpr unsigned kGetTransform           = 45;
         constexpr unsigned kSetViewport            = 47;
         constexpr unsigned kGetViewport            = 48;
         constexpr unsigned kSetRenderState         = 57;
         constexpr unsigned kGetRenderState         = 58;
+        constexpr unsigned kGetTexture             = 64;
         constexpr unsigned kSetTexture             = 65;
-        constexpr unsigned kGetTexture             = 66;
+        constexpr unsigned kGetTextureStageState   = 66;
+        constexpr unsigned kSetTextureStageState   = 67;
         constexpr unsigned kSetSamplerState        = 69;
         constexpr unsigned kDrawPrimitiveUP        = 83;
         constexpr unsigned kSetFVF                 = 89;
@@ -197,10 +378,13 @@ namespace wxl::offsets::engine::gx
         constexpr unsigned kGetVertexShader        = 93;
         constexpr unsigned kSetVertexShaderConstantF = 94;
         constexpr unsigned kGetVertexShaderConstantF = 95;
+        constexpr unsigned kSetStreamSource        = 100;
+        constexpr unsigned kGetStreamSource        = 101;
         constexpr unsigned kCreatePixelShader      = 106;
         constexpr unsigned kSetPixelShader         = 107;
         constexpr unsigned kGetPixelShader         = 108;
         constexpr unsigned kSetPixelShaderConstantF = 109;
+        constexpr unsigned kGetPixelShaderConstantF = 110;
         constexpr unsigned kDrawIndexedPrimitive   = 0x148 / 4;
     }
 
@@ -220,4 +404,21 @@ namespace wxl::offsets::engine::gx
     constexpr uintptr_t kVsConstCache     = 0x00C5EFE8; // float[256*4]: register N at [N*4] floats
     constexpr uintptr_t kVsDirtyRegStart  = 0x00C5FFEC; // uint32: lowest dirty register (0xFF = none)
     constexpr uintptr_t kVsDirtyRegEnd    = 0x00C5FFE8; // uint32: highest dirty register (0 = none)
+    constexpr unsigned  kVsConstRegisters = 256;        // registers in the file the cache mirrors
+    // Where the M2 skinning palette lands in that file. The upload transposes each bone's upper 3x4
+    // into three consecutive vec4s, so bone N owns registers [kVsBonePaletteBase + N*kVsBonePaletteRegs,
+    // + kVsBonePaletteRegs) and its translation is the fourth component of each of the three rather
+    // than a row of its own. The palette runs to the end of the file, which is what fixes the per-draw
+    // bone ceiling at (kVsConstRegisters - kVsBonePaletteBase) / kVsBonePaletteRegs.
+    constexpr unsigned  kVsBonePaletteBase = 31;
+    constexpr unsigned  kVsBonePaletteRegs = 3;
+    // The PIXEL half of the same structure, and the reason a constant written for one draw is still
+    // there for the next: both caches are process-wide, not per-shader. The setter (0x0069E970,
+    // reached through the device vtable at +0x118) forks on its target argument -- 0 takes the vertex
+    // arrays above, anything else takes these. ShaderConstantsClear (0x006833A0) clears both as
+    // 0x400 dwords each, which is what fixes them at 256 registers and makes the two halves
+    // contiguous: cache, dirty-end, dirty-start, then the next cache.
+    constexpr uintptr_t kPsConstCache     = 0x00C5DFE0; // float[256*4], CGxDevice::s_shadowConstants
+    constexpr uintptr_t kPsDirtyRegStart  = 0x00C5EFE4; // uint32: lowest dirty register (0xFF = none)
+    constexpr uintptr_t kPsDirtyRegEnd    = 0x00C5EFE0; // uint32: highest dirty register (0 = none)
 }

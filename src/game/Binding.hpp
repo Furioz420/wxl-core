@@ -17,44 +17,14 @@
 #pragma once
 
 #include <cstdint>
-#include <span>
 
 /**
  * @brief Exposes a client function as a typed call via a plain function-pointer cast.
  *
  * The call is a zero-overhead pointer cast (no vtable, no std::function), safe in any path.
- * The catalog is a parallel enumerable registry of {name, address, signature}.
  */
 namespace wxl::game
 {
-    /**
-     * @brief One enumerable catalog entry for a curated client function.
-     *
-     * name is the curated, human-readable name; signature is a display/scripting-bridge string.
-     */
-    struct BindingInfo
-    {
-        const char* name;
-        uintptr_t   address;
-        const char* signature;
-    };
-
-    /**
-     * @brief Adds an entry to the enumerable catalog.
-     * @param info  the catalog entry to register.
-     */
-    void Register(const BindingInfo& info);
-
-    /** @brief Returns a view over all registered catalog entries. */
-    std::span<const BindingInfo> Catalog();
-
-    /**
-     * @brief Looks up a catalog entry by name.
-     * @param name  the curated entry name to find.
-     * @return the matching entry, or null if no entry has that name.
-     */
-    const BindingInfo* Find(const char* name);
-
     /**
      * @brief Returns a client address as a typed function pointer.
      * @param address  the client address to cast.

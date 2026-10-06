@@ -25,11 +25,57 @@
 namespace wxl::offsets::game::doodad
 {
     // --- spawn ---
-    // Build a CMapDoodad from an MDDF placement (modelName, MDDF entry, tile origin). Returns the new
-    // CMapDoodad* in EAX. The "a placed doodad was created" point.
+    // Builds a placed-doodad object from an MDDF placement (modelName, MDDF entry, tile origin).
+    // Returns the new object pointer in EAX. The "a placed doodad was created" point.
     constexpr uintptr_t kSpawnFromMDDF = 0x007BECD0;
-    // __cdecl, 3 stack args, returns CMapDoodad*.
+    // __cdecl, 3 stack args, returns the new placed-doodad object pointer.
     using SpawnFromMDDFFn = void*(__cdecl*)(const char* modelName, void* mddf, void* tileOrigin);
+
+    // Builds a placed doodad embedded in a WMO group. WMO-authored instance
+    // portals use this separate overload and never pass through the MDDF path.
+    constexpr uintptr_t kSpawnFromWmoGroup = 0x007BEF40;
+    using SpawnFromWmoGroupFn = void*(__cdecl*)(
+        uint32_t id, void* definition, const char* modelName, void* placement,
+        void* parentMatrix, uint16_t doodadSet);
+
+    // Native CMapStaticEntity model initializer. Used to coherently replace a
+    // resident legacy portal model after the selected dungeon difficulty changes.
+    constexpr uintptr_t kCreateModel = 0x007BDA70;
+    using CreateModelFn = int(__cdecl*)(
+        const char* modelName, void* doodad, int waitForLoad,
+        int staticModelFlags);
+
+    // The MDDF record kSpawnFromMDDF reads (0x24 bytes, standard MDDF layout, unchanged since
+    // Classic): nameId/uniqueId (u32 each) at +0x00/+0x04, position (3 floats, archived coordinate
+    // convention) at +0x08/+0x0C/+0x10, rotation at +0x14/+0x18/+0x1C, scale (u16, 1024 = 100%) at
+    // +0x20, flags (u16) at +0x22 -- the last two already load-bearing elsewhere in this codebase.
+    constexpr size_t kMddfPosX  = 0x08;
+    constexpr size_t kMddfPosY  = 0x0C;
+    constexpr size_t kMddfPosZ  = 0x10;
+    // Uniform scale, u16 with 1024 = 100%. The spawn path's own conversion, byte-verified at the call
+    // site that fills kScale: doodad.scale = (float)mddf.scaleU16 * kMddfScaleToFloat. Reading it here
+    // is what lets a caller size a placement BEFORE the model exists to be measured.
+    constexpr size_t kMddfScale = 0x20;
+    constexpr float  kMddfScaleToFloat = 0.0009765625f; // 1/1024
+    // World position from an MDDF record, confirmed at kSpawnFromMDDF's own call site:
+    // worldX = tileOrigin.x - mddf.posZ, worldY = tileOrigin.y - mddf.posX,
+    // worldZ = tileOrigin.z + mddf.posY -- the same axis-swap/negate every archived-coordinate
+    // consumer in this codebase applies. tileOrigin is the constant {17066.666, 17066.666, 0} for
+    // every MDDF-driven spawn (the per-chunk placement walk never passes anything else), so a caller
+    // that only cares about ordinary terrain placements can use that literal instead of threading the
+    // pointer through.
+    constexpr float kMddfTileOriginX = 17066.666f;
+    constexpr float kMddfTileOriginY = 17066.666f;
+
+    // Runtime teardown of one resident placed doodad -- releases its render context (clearing the
+    // event/sequence callbacks first, matching kSetEventCallback/kSetSequenceCallback's own wiring at
+    // spawn, see offsets/game/M2.hpp), unlinks it from its owning chunk's list and its own global
+    // list, and returns it to the doodad pool. __cdecl, 1 stack arg (the doodad). No-op (does not
+    // free) when the doodad's own refcount (+0xA) is still nonzero -- a caller must have already
+    // dropped every link referencing it first, which this codebase does not yet do directly; only
+    // observe this hook, never call it to force a premature free.
+    constexpr uintptr_t kDoodadPurge = 0x007C3020;
+    using DoodadPurgeFn = void(__cdecl*)(void* doodad);
 
     // --- placed-doodad object fields ---
     constexpr size_t kFlags = 0x0C; // 1 = normal placement
@@ -42,7 +88,7 @@ namespace wxl::offsets::game::doodad
 
     // bbox min / sphere center / bbox max. WARNING: at spawn all three are set equal to the position (a
     // degenerate point), never the model's real extents and never recomputed. Not usable as a real box;
-    // a real wireframe must transform the CM2Model local bounds by the live instance matrix.
+    // a real wireframe must transform the model's local bounds by the live instance matrix.
     constexpr size_t kBBoxMinX = 0x38;
     constexpr size_t kBBoxMinY = 0x3C;
     constexpr size_t kBBoxMinZ = 0x40;
@@ -54,24 +100,24 @@ namespace wxl::offsets::game::doodad
     constexpr size_t kBBoxMaxZ = 0x5C;
 
     // Staging matrix (float[16], row-major) composed once at spawn. NOT what the renderer reads: the spawn
-    // copies it once into the CM2 render instance (kInstWorldMatrix), then never touches it again. Writing
-    // here does NOT move the model; kept only as the editor-facing source of truth.
+    // copies it once into the model render instance (kInstWorldMatrix), then never touches it again.
+    // Writing here does NOT move the model; kept only as the editor-facing source of truth.
     constexpr size_t kWorldMatrix      = 0xD8;
     constexpr size_t kWorldMatrixTransX = 0x108;
     constexpr size_t kWorldMatrixTransY = 0x10C;
     constexpr size_t kWorldMatrixTransZ = 0x110;
 
-    // --- CM2 render instance (the object the renderer actually draws) ---
-    // doodad+0x34 -> CM2 instance. The live world matrix the renderer multiplies every frame lives on the
-    // instance, not the doodad. To move/rotate/scale a placed doodad you write kInstWorldMatrix.
-    constexpr size_t kInstance        = 0x34; // doodad -> CM2 render instance (0 mid async-load)
+    // --- model render instance (the object the renderer actually draws) ---
+    // doodad+0x34 -> model render instance. The live world matrix the renderer multiplies every frame
+    // lives on the instance, not the doodad. To move/rotate/scale a placed doodad you write kInstWorldMatrix.
+    constexpr size_t kInstance        = 0x34; // doodad -> model render instance (0 mid async-load)
     constexpr size_t kInstWorldMatrix = 0xB4; // float[16] row-major, READ every frame, never rewritten
     constexpr size_t kInstTransX      = 0xE4; // translation row of the live matrix (= world X/Y/Z)
     constexpr size_t kInstTransY      = 0xE8;
     constexpr size_t kInstTransZ      = 0xEC;
-    constexpr size_t kInstModel       = 0x2C; // instance -> CM2Model cache node
+    constexpr size_t kInstModel       = 0x2C; // instance -> model cache node
 
-    // --- CM2Model cache node (holds the file path + the parsed MD20 header) ---
+    // --- model cache node (holds the file path + the parsed MD20 header) ---
     constexpr size_t kModelFullPath = 0x3C;  // inline NUL-terminated normalized path (take address)
     constexpr size_t kModelFileName = 0x140; // char* to the bare filename (points into the +0x3C buffer)
     constexpr size_t kModelHeader   = 0x150; // ptr to the parsed MD20 header blob (the local-bounds source)
@@ -93,7 +139,7 @@ namespace wxl::offsets::game::doodad
     // --- typed views over the objects above ---
     // The constants are the curated landmarks; these structs give named, typed access to the same fields,
     // with every member offset checked against a constant at compile time (a wrong padding fails the build).
-    // Only RE'd fields are named; the gaps are explicit padding. Pointers are 4 bytes on the 32-bit client.
+    // Only known fields are named; the gaps are explicit padding. Pointers are 4 bytes on the 32-bit client.
 #pragma pack(push, 1)
     /** @brief Placed-doodad object: one per map M2 placement (the "d" pointer). */
     struct MapDoodad

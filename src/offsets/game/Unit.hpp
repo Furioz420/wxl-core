@@ -29,10 +29,16 @@ namespace wxl::offsets::game::unit
     // --- entries ---
     // Resolve a GUID to an object (guid, typemask, tag, flag). tag is a debug string, flag is 0.
     constexpr uintptr_t kGetObjectByGuid = 0x004D4DB0;
+    // Walk every resident object, one callback per object, carrying the GUID as two dwords. Returning 0
+    // from the callback stops the walk. Main thread only: the list head is read from thread-local storage,
+    // so off it the enumerator walks another thread's manager or none.
+    constexpr uintptr_t kEnumObjects = 0x004D4B30;
     // Active player GUID ().
     constexpr uintptr_t kActivePlayerGuid = 0x004D3790;
     // Reaction of self toward other (this-in-ECX): 0..1 hostile, 2..3 neutral, 4+ friendly.
     constexpr uintptr_t kUnitReaction = 0x007251C0;
+    // Resolves an AnimationData id against the unit's currently displayed M2 model.
+    constexpr uintptr_t kResolveModelAnimation = 0x007176F0;
 
     // --- object lifecycle (server-driven) ---
     // Object update-block handler: parses a server update message, creating new objects in the object
@@ -53,31 +59,103 @@ namespace wxl::offsets::game::unit
     using TargetSetFn = int(__cdecl*)(void* scriptState);
 
     // --- object field offsets ---
-    constexpr size_t kUnitModelField   = 0xB4; // unit object -> body model
-    constexpr size_t kModelParentField = 0x48; // model -> parent model (0 = root)
+    constexpr size_t kUnitModelField    = 0xB4;  // unit object -> body model
+    constexpr size_t kModelParentField  = 0x48;  // model -> parent model (0 = root)
+    constexpr size_t kUnitPositionField = 0x798; // unit object -> world position (3 floats x, y, z)
+    constexpr size_t kUnitFacingField   = 0x7A8; // float: heading, radians, counter-clockwise from +x
+    constexpr size_t kUnitPitchField    = 0x7AC; // float: pitch, radians, positive nose-up
+    constexpr size_t kUnitMoveFlagsField= 0x7CC; // uint32: the movement-state bits the server mirrors
+    constexpr size_t kObjectHeaderField = 0x08;  // any object -> header carrying its GUID and type mask
+    constexpr size_t kHeaderGuidField   = 0x00;  // header -> GUID
+    constexpr size_t kHeaderTypeField   = 0x08;  // header -> type mask; what kGetObjectByGuid filters on
+    // unit object -> owned CharacterComponent (the equip/model render state CharEquipSlotUpdate and
+    // the geoset/attach pipeline operate on; null for non-humanoid units, or a humanoid unit with no
+    // component built yet). Confirmed via disassembly 2026-08-16 at two independent read sites gating
+    // CCharacterComponent__AddItemBySlot. Not the same field as kUnitModelField just above -- 0xB4 and
+    // 0xB4C are easy to misread as the same offset, they are not.
+    constexpr size_t kUnitCharacterComponentField = 0xB4C;
+
+    // --- virtual slots shared by every object type ---
+    // Every object type's descendants agree on this part of their vtable. Only these four are common:
+    // past them the layouts diverge, and two of the slots below them are stubs on some types.
+    constexpr size_t kVtNamePosition = 8;  // anchor above the model, where the client hangs the name
+    constexpr size_t kVtPosition     = 11; // world position; the base implementation reports the origin
+    constexpr size_t kVtRawPosition  = 12;
+    // Orientation, radians counter-clockwise from +X. Confirmed by disassembly 2026-09-11 at two
+    // independent call sites (0x004F6A96 and 0x00522112, the latter on the active player straight out
+    // of kGetObjectByGuid): both load slot 13, call it with this in ECX and nothing on the stack, and
+    // take the result off the FPU stack with fstp, which makes it a float return. Both then feed it
+    // straight to fsincos and store cos into x and sin into y, which is what fixes the convention:
+    // facing 0 points along +X and the angle increases counter-clockwise.
+    constexpr size_t kVtFacing       = 13;
 
     // --- type masks ---
-    constexpr uint32_t kTypeMaskUnit   = 0x08;
-    constexpr uint32_t kTypeMaskPlayer = 0x10;
+    // Bit per object category. A lookup passes the set it accepts and yields null for anything else, so
+    // these select a category rather than merely describing one.
+    constexpr uint32_t kTypeMaskObject        = 0x01;
+    constexpr uint32_t kTypeMaskItem          = 0x02;
+    constexpr uint32_t kTypeMaskContainer     = 0x04;
+    constexpr uint32_t kTypeMaskUnit          = 0x08;
+    constexpr uint32_t kTypeMaskPlayer        = 0x10;
+    constexpr uint32_t kTypeMaskGameObject    = 0x20;
+    constexpr uint32_t kTypeMaskDynamicObject = 0x40;
+    constexpr uint32_t kTypeMaskCorpse        = 0x80;
 
     // --- signatures ---
     using GetObjectFn        = void*(__cdecl*)(unsigned long long guid, unsigned typemask,
                                                const char* tag, int flag);
     using ActivePlayerGuidFn = unsigned long long(__cdecl*)();
     using ReactionFn         = int(__fastcall*)(void* self, void* edx, void* other);
+    using EnumStepFn         = int(__cdecl*)(uint32_t guidLow, uint32_t guidHigh, void* user);
+    using EnumObjectsFn      = int(__cdecl*)(EnumStepFn step, void* user);
+    using PositionFn         = void(__thiscall*)(void* self, float out[3]);
+    // No out-param and no stack argument, unlike PositionFn just above: the angle comes back in st(0).
+    using FacingFn           = float(__thiscall*)(void* self);
 
     // --- typed views over the objects above ---
     // The constants are the curated landmarks; these structs give named, typed access to the same fields,
     // with every member offset checked against a constant at compile time (a wrong padding fails the build).
-    // Only RE'd fields are named; the gaps are explicit padding. Pointers are 4 bytes on the 32-bit client.
+    // Only known fields are named; the gaps are explicit padding. Pointers are 4 bytes on the 32-bit client.
 #pragma pack(push, 1)
-    /** @brief Unit / world object: the body-model slot. */
+    /** @brief Unit / world object: body model, world/movement state, and owned character component. */
     struct UnitObject
     {
         uint8_t  _pad00[kUnitModelField];
         void*    model;            // kUnitModelField -> body model
+        uint8_t  _pad01[kUnitPositionField - kUnitModelField - sizeof(void*)];
+        float    position[3];      // kUnitPositionField -> world position x, y, z
+        uint8_t  _pad02[kUnitFacingField - kUnitPositionField - sizeof(float) * 3];
+        float    facing;           // kUnitFacingField
+        float    pitch;            // kUnitPitchField
+        uint8_t  _pad03[kUnitMoveFlagsField - kUnitPitchField - sizeof(float)];
+        uint32_t moveFlags;        // kUnitMoveFlagsField
+        uint8_t  _pad04[kUnitCharacterComponentField - kUnitMoveFlagsField - sizeof(uint32_t)];
+        void*    characterComponent; // kUnitCharacterComponentField -> owned CharacterComponent
     };
     static_assert(offsetof(UnitObject, model) == kUnitModelField, "UnitObject.model");
+    static_assert(offsetof(UnitObject, position) == kUnitPositionField, "UnitObject.position");
+    static_assert(offsetof(UnitObject, facing) == kUnitFacingField, "UnitObject.facing");
+    static_assert(offsetof(UnitObject, pitch) == kUnitPitchField, "UnitObject.pitch");
+    static_assert(offsetof(UnitObject, moveFlags) == kUnitMoveFlagsField, "UnitObject.moveFlags");
+    static_assert(offsetof(UnitObject, characterComponent) == kUnitCharacterComponentField,
+                  "UnitObject.characterComponent");
+
+    /** @brief Object header: the GUID and the type mask the object lookup filters on. */
+    struct ObjectHeader
+    {
+        unsigned long long guid;     // kHeaderGuidField
+        uint32_t           typeMask; // kHeaderTypeField
+    };
+    static_assert(offsetof(ObjectHeader, guid) == kHeaderGuidField, "ObjectHeader.guid");
+    static_assert(offsetof(ObjectHeader, typeMask) == kHeaderTypeField, "ObjectHeader.typeMask");
+
+    /** @brief What every object carries regardless of its concrete type: the header slot. */
+    struct ObjectBase
+    {
+        uint8_t       _pad00[kObjectHeaderField];
+        ObjectHeader* header;      // kObjectHeaderField -> GUID + type mask
+    };
+    static_assert(offsetof(ObjectBase, header) == kObjectHeaderField, "ObjectBase.header");
 
     /** @brief Model object: the parent slot in the attachment chain. */
     struct ModelObject

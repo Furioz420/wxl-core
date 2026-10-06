@@ -17,7 +17,10 @@
 #include "patcher/PatchScript.hpp"
 #include "patcher/PeImage.hpp"
 
+#include "common/Log.hpp"
+
 #include <windows.h>
+#include <io.h>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -39,27 +42,35 @@ namespace
         std::vector<uint8_t> data;
         FILE* f = nullptr;
         if (fopen_s(&f, path, "rb") != 0 || !f) return data;
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        data.resize(size);
-        fread(data.data(), 1, size, f);
+        long size = -1;
+        if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+        if (size < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return data; }
+        data.resize(static_cast<size_t>(size));
+        if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
         fclose(f);
         return data;
     }
 
     /**
-     * @brief Writes a byte buffer to a file, overwriting any existing contents.
+     * @brief Writes a byte buffer to a file atomically: the bytes go to a sibling temp file,
+     *        flushed to disk, then swapped into place. The target is either fully replaced or
+     *        untouched - a crash or short write can never leave it truncated.
      * @param path  file path to write.
      * @param data  bytes to write.
-     * @return True on success, false if the file cannot be opened.
+     * @return True on success, false on any I/O failure (the temp file is removed).
      */
     bool WriteAll(const char* path, const std::vector<uint8_t>& data)
     {
+        const std::string tmp = std::string(path) + ".wxltmp";
         FILE* f = nullptr;
-        if (fopen_s(&f, path, "wb") != 0 || !f) return false;
-        fwrite(data.data(), 1, data.size(), f);
-        fclose(f);
+        if (fopen_s(&f, tmp.c_str(), "wb") != 0 || !f) return false;
+        const bool written = fwrite(data.data(), 1, data.size(), f) == data.size()
+                          && fflush(f) == 0
+                          && _commit(_fileno(f)) == 0;
+        const bool closed = fclose(f) == 0;
+        if (!written || !closed) { remove(tmp.c_str()); return false; }
+        if (!MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        { remove(tmp.c_str()); return false; }
         return true;
     }
 }
@@ -74,37 +85,50 @@ namespace
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    wxl::log::EnableConsole("[WarcraftXL] "); // progress to stdout, failures to stderr
     const char* target = argc > 1 ? argv[1] : "Wow.exe";
-    printf("[WarcraftXL] patcher start, target='%s'\n", target);
+    WLOG_INFO("patcher start, target='%s'", target);
 
     std::vector<uint8_t> file = ReadAll(target);
-    if (file.empty()) { printf("[WarcraftXL] cannot read '%s'\n", target); return 1; }
+    if (file.empty()) { WLOG_ERROR("cannot read '%s'", target); return 1; }
 
     wxl::patcher::PeImage pe(file);
-    if (!pe.valid()) { printf("[WarcraftXL] not a 32-bit PE\n"); return 1; }
-    if (pe.HasSection(kTagSection))
-    { printf("[WarcraftXL] already patched ('%s' present)\n", kTagSection); return 0; }
+    if (!pe.valid()) { WLOG_ERROR("'%s' is not a 32-bit PE", target); return 1; }
 
-    // 4 GB address space, then every registered PatchScript (byte edits), then the import (structural).
+    // Always ensure 4 GB address space, even when an older patcher already injected the .wxl section.
     pe.SetLargeAddressAware();
+    if (pe.HasSection(kTagSection))
+    {
+        if (!WriteAll(target, file)) { WLOG_ERROR("cannot write '%s'", target); return 1; }
+        WLOG_INFO("already patched ('%s' present), ensured large-address-aware", kTagSection);
+        return 0;
+    }
 
+    // Apply every registered PatchScript (byte edits), then the import (structural).
     for (wxl::patcher::PatchScript* const s : wxl::patcher::registry::Scripts())
     {
         if (!s->Apply(pe))
-        { printf("[WarcraftXL] patch-script '%s' FAILED\n", s->name()); return 1; }
-        printf("[WarcraftXL] applied patch-script '%s'\n", s->name());
+        { WLOG_ERROR("patch-script '%s' FAILED", s->name()); return 1; }
+        WLOG_INFO("applied patch-script '%s'", s->name());
     }
 
     if (!pe.AddImport(kDllName, kFuncName, kTagSection))
-    { printf("[WarcraftXL] import injection failed\n"); return 1; }
+    { WLOG_ERROR("import injection failed"); return 1; }
 
+    // The backup is the only recovery path if the patched image misbehaves: refuse to touch the
+    // target until it is confirmed on disk.
     std::string backup = std::string(target) + ".orig";
-    if (GetFileAttributesA(backup.c_str()) == INVALID_FILE_ATTRIBUTES)
-        CopyFileA(target, backup.c_str(), TRUE);
+    if (GetFileAttributesA(backup.c_str()) == INVALID_FILE_ATTRIBUTES
+        && !CopyFileA(target, backup.c_str(), TRUE))
+    {
+        WLOG_ERROR("cannot back up '%s' to '%s' (win32=%lu), aborting before write",
+                   target, backup.c_str(), GetLastError());
+        return 1;
+    }
 
-    if (!WriteAll(target, file)) { printf("[WarcraftXL] cannot write '%s'\n", target); return 1; }
+    if (!WriteAll(target, file)) { WLOG_ERROR("cannot write '%s'", target); return 1; }
 
-    printf("[WarcraftXL] patched '%s' (+import %s!%s, %zu patch-scripts, backup '%s')\n",
-           target, kDllName, kFuncName, wxl::patcher::registry::Scripts().size(), backup.c_str());
+    WLOG_INFO("patched '%s' (+import %s!%s, %zu patch-scripts, backup '%s')",
+              target, kDllName, kFuncName, wxl::patcher::registry::Scripts().size(), backup.c_str());
     return 0;
 }

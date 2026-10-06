@@ -1,0 +1,154 @@
+// Window-input detour: subclass the client window and publish OnInput, swallowing consumed messages.
+// Copyright (C) 2026 WarcraftXL
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "config.hpp"
+#include "engine/hook/Registry.hpp"
+#include "engine/events/Event.hpp"
+
+#include "common/Log.hpp"
+#include "game/Pick.hpp"
+#include "game/Gx.hpp"
+#include "WindowBinding.hpp"
+#include <d3d9.h>
+
+#include <windows.h>
+
+namespace
+{
+    namespace ev    = wxl::events;
+    namespace world = wxl::game::world;
+
+    wxl::input::WindowBinding& Binding()
+    { static auto* binding = new wxl::input::WindowBinding; return *binding; }
+
+    /**
+     * @brief Selects the top-level visible window owned by this process.
+     * @param h    candidate window handle from the enumeration.
+     * @param out  receives the matched HWND.
+     * @return FALSE to stop enumeration on a match, TRUE to continue.
+     */
+    BOOL CALLBACK PickWindow(HWND h, LPARAM out)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == GetCurrentProcessId() && GetWindow(h, GW_OWNER) == nullptr && IsWindowVisible(h))
+        {
+            *reinterpret_cast<HWND*>(out) = h;
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    /**
+     * @brief Finds the client window by enumeration, with a window-class lookup fallback.
+     * @return the window handle, or null if none is found.
+     */
+    HWND FindGameWindow()
+    {
+        HWND h = nullptr;
+        EnumWindows(&PickWindow, reinterpret_cast<LPARAM>(&h));
+        if (!h) h = FindWindowA("GxWindowClass", nullptr);
+        return h;
+    }
+
+    /**
+     * @brief Republishes every window message as OnInput, swallowing it when a subscriber sets handled.
+     * @param h  window handle.
+     * @param m  message id.
+     * @param w  message WPARAM.
+     * @param l  message LPARAM.
+     * @return 0 when the message is consumed, otherwise the original window procedure result.
+     */
+    LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
+    {
+        const auto original = Binding().Original(h);
+        if (!original) return DefWindowProcA(h, m, w, l);
+        // Destruction must reach the native procedure even if an overlay is
+        // capturing input. Retire this HWND so handle reuse cannot inherit it.
+        if (m == WM_NCDESTROY)
+        {
+            const auto result = CallWindowProcA(original, h, m, w, l);
+            Binding().Forget(h);
+            return result;
+        }
+        if (h != Binding().Active()) return CallWindowProcA(original, h, m, w, l);
+        // A minimized client can occasionally receive the user's restore/activation request while
+        // remaining WS_MINIMIZE at the Win32 layer. WoW then quite correctly leaves the graphics
+        // device's visible/context flags false and spends every paint tick in OsSleep, which looks
+        // like a frozen client after switching back. Re-issuing the ordinary Win32 restore only when
+        // the user is actively restoring/activating the app repairs that missed transition without
+        // changing the client's intentional background behaviour while it remains minimized.
+        const bool restoreCommand =
+            m == WM_SYSCOMMAND && (w & 0xFFF0u) == SC_RESTORE;
+        const bool activating =
+            (m == WM_ACTIVATEAPP && w != FALSE) ||
+            (m == WM_ACTIVATE && LOWORD(w) != WA_INACTIVE);
+        if ((restoreCommand || activating) && IsIconic(h))
+        {
+            static unsigned logged = 0;
+            if (logged++ < 4)
+                WLOG_INFO("input: repairing missed window restore (message=0x%04X)", m);
+            ShowWindowAsync(h, SW_RESTORE);
+        }
+
+        bool handled = false;
+        ev::InputArgs a{ m, static_cast<uintptr_t>(w), static_cast<uintptr_t>(l), &handled };
+        ev::Emit(ev::Event::OnInput, &a);
+        if (handled) return 0;
+
+        // An unconsumed world click: resolve the cursor to a world point/object and publish OnWorldClick.
+        if (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN)
+        {
+            world::WorldHit hit;
+            if (world::PickCursor(hit))
+            {
+                ev::WorldClickArgs wc{ m, hit.type, hit.pos.x, hit.pos.y, hit.pos.z, hit.objLo, hit.objHi };
+                ev::Emit(ev::Event::OnWorldClick, &wc);
+            }
+        }
+        return CallWindowProcA(original, h, m, w, l);
+    }
+
+    void ReconcileInput(void*, const void*)
+    {
+        HWND window = nullptr;
+        if (auto* device = static_cast<IDirect3DDevice9*>(wxl::game::gx::RawDevice()))
+        {
+            D3DDEVICE_CREATION_PARAMETERS params{};
+            if (SUCCEEDED(device->GetCreationParameters(&params))) window = params.hFocusWindow;
+        }
+        if (!window || !IsWindow(window)) window = FindGameWindow();
+        if (!window || window == Binding().Active()) return;
+        if (Binding().Bind(window, WndProc))
+            WLOG_INFO("input: window subclassed (hwnd=%p), OnInput live", window);
+    }
+
+    /**
+     * @brief Subclasses the client window and routes its messages through WndProc.
+     *
+     * A missing window is not fatal: OnInput simply stays inactive, so the installer still reports
+     * success to the registry.
+     */
+    bool InstallInput()
+    {
+        ReconcileInput(nullptr, nullptr);
+        ev::Subscribe(ev::Event::OnUpdate, ReconcileInput, nullptr);
+        ev::Subscribe(ev::Event::OnEndScene, ReconcileInput, nullptr);
+        return true;
+    }
+}
+
+WXL_REGISTER_FEATURE("input", true, InstallInput)
