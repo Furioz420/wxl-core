@@ -65,7 +65,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
     # consumer in the plain DLL, so excluding them here is what keeps that true instead of shipping
     # four unused cross-target .cpp files inside WarcraftXL.dll by glob accident.
     list(FILTER WXL_CORE_SRC EXCLUDE REGEX
-         "/src/patcher/|/src/engine/gpu/|/src/engine/assets/shared/(models/m2|models/m3|textures/blp|textures/dds)/")
+         "/src/extension-support/|/src/patcher/|/src/engine/gpu/|/src/engine/assets/shared/(models/m2|models/m3|textures/blp|textures/dds)/")
 
     # =========================================================================
     # Target 1: WarcraftXL.dll  (32-bit, injected) = engine + features + assets pipelines
@@ -93,7 +93,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 
     add_subdirectory(deps/minhook)
     target_link_libraries(WarcraftXL PRIVATE minhook d3d9 shell32)
-    target_compile_definitions(WarcraftXL PRIVATE ${WXL_DEFS})
+    target_compile_definitions(WarcraftXL PRIVATE ${WXL_DEFS} "IMGUI_API=__declspec(dllexport)")
 
     source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${WXL_CORE_SRC})
 
@@ -156,6 +156,8 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         endif()
         get_filename_component(wxl_ext_name "${wxl_ext_dir}" NAME)
         file(GLOB_RECURSE WXL_EXT_SRC CONFIGURE_DEPENDS "${wxl_ext_dir}/*.cpp")
+        # Standalone regression programs and server modules are not extension DLL translation units.
+        list(FILTER WXL_EXT_SRC EXCLUDE REGEX "/(tests?|server)/")
         if(NOT WXL_EXT_SRC)
             continue()
         endif()
@@ -172,12 +174,14 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 4)
         add_library(${wxl_ext_name} SHARED ${WXL_EXT_SRC} ${WXL_SDK_SRC})
         set_target_properties(${wxl_ext_name} PROPERTIES OUTPUT_NAME "${wxl_ext_name}" PREFIX "")
         target_include_directories(${wxl_ext_name} PRIVATE
+            "${wxl_ext_dir}/src"
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
         # WXL_EXTENSION is what makes PluginApi.h declare the two entry points as exports. It belongs on
         # the target rather than in a source file: an extension that forgets it still builds, and fails
         # only at load with "exports no WXL_Query/WXL_Load".
         target_compile_definitions(${wxl_ext_name} PRIVATE ${WXL_DEFS} WXL_EXTENSION)
+        include("${wxl_ext_dir}/target.cmake" OPTIONAL)
 
         if(CLIENT_PATH)
             add_custom_command(TARGET ${wxl_ext_name} POST_BUILD
